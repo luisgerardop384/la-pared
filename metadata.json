@@ -1,0 +1,6 @@
+{
+  "name": "La Pared",
+  "description": "Lienzo infinito minimalista totalmente blanco donde cualquier persona puede explorar, grabar una única inscripción en coordenadas exactas y descargar automáticamente su foto con coordenadas.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
