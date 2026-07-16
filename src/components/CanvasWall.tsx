@@ -49,11 +49,14 @@ export default function CanvasWall({
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const [dragStartOffset, setDragStartOffset] = useState({ x: 0, y: 0 });
 
-  const [width, setWidth] = useState(800);
-  const [height, setHeight] = useState(600);
+  const [width, setWidth] = useState(() => typeof window !== "undefined" ? window.innerWidth : 800);
+  const [height, setHeight] = useState(() => typeof window !== "undefined" ? window.innerHeight : 600);
 
-  // Camera scale (Zoom limits: MIN_SCALE=0.35, MAX_SCALE=1.8, starts at 1.0)
-  const [scale, setScale] = useState(1.0);
+  // Camera scale (Zoom limits: MIN_SCALE=0.35, MAX_SCALE=1.8, starts at 1.0 on desktop, 0.65 on mobile)
+  const [scale, setScale] = useState(() => {
+    const isMobileInitial = typeof window !== "undefined" && window.innerWidth < 768;
+    return isMobileInitial ? 0.65 : 1.0;
+  });
   const MIN_SCALE = 0.35;
   const MAX_SCALE = 1.8;
 
@@ -285,29 +288,174 @@ export default function CanvasWall({
     setIsDragging(false);
   };
 
-  // Touch support for mobile devices
-  const handleTouchStart = (e: React.TouchEvent) => {
-    const target = e.target as HTMLElement;
-    if (target.closest(".interactive-note") || target.closest(".wall-ui-element")) return;
+  // Touch tracking refs for ultra-smooth 60/120fps direct DOM manipulation
+  const touchStartRef = useRef({ x: 0, y: 0 });
+  const touchStartOffsetRef = useRef({ x: 0, y: 0 });
+  const isTouchDraggingRef = useRef(false);
 
-    setIsDragging(true);
-    const touch = e.touches[0];
-    setDragStart({ x: touch.clientX, y: touch.clientY });
-    setDragStartOffset({ x: offsetX, y: offsetY });
-  };
+  // Pinch-to-zoom tracking refs
+  const isPinchingRef = useRef(false);
+  const initialPinchDistanceRef = useRef(0);
+  const initialPinchScaleRef = useRef(1.0);
 
-  const handleTouchMove = (e: React.TouchEvent) => {
-    if (!isDragging) return;
-    const touch = e.touches[0];
-    const dx = touch.clientX - dragStart.x;
-    const dy = touch.clientY - dragStart.y;
-    setOffsetX(Math.round(dragStartOffset.x - dx / scale));
-    setOffsetY(Math.round(dragStartOffset.y - dy / scale));
-  };
+  // Sync state values with refs to prevent stale state closures in native listeners
+  const offsetXRef = useRef(offsetX);
+  const offsetYRef = useRef(offsetY);
+  const scaleRef = useRef(scale);
+  const widthRef = useRef(width);
+  const heightRef = useRef(height);
 
-  const handleTouchEnd = () => {
-    setIsDragging(false);
-  };
+  useEffect(() => {
+    offsetXRef.current = offsetX;
+  }, [offsetX]);
+
+  useEffect(() => {
+    offsetYRef.current = offsetY;
+  }, [offsetY]);
+
+  useEffect(() => {
+    scaleRef.current = scale;
+  }, [scale]);
+
+  useEffect(() => {
+    widthRef.current = width;
+    heightRef.current = height;
+  }, [width, height]);
+
+  // Native touch listener to prevent default browser overscroll refresh, elastic bounce, page zoom, and enable pinch-to-zoom
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    let animationFrameId: number | null = null;
+    let pendingUpdate = false;
+
+    const requestUpdate = () => {
+      if (pendingUpdate) return;
+      pendingUpdate = true;
+      animationFrameId = requestAnimationFrame(() => {
+        pendingUpdate = false;
+        
+        // Direct, high-speed DOM transform for perfect fluid movement
+        const paredCanvas = document.getElementById("pared-canvas");
+        if (paredCanvas) {
+          const s = scaleRef.current;
+          const oX = offsetXRef.current;
+          const oY = offsetYRef.current;
+          const w = widthRef.current;
+          const h = heightRef.current;
+          const camX = -oX + w / (2 * s);
+          const camY = -oY + h / (2 * s);
+          
+          paredCanvas.style.transform = `scale(${s}) translate3d(${Math.round(camX)}px, ${Math.round(camY)}px, 0px)`;
+        }
+      });
+    };
+
+    const handleTouchStartNative = (e: TouchEvent) => {
+      const target = e.target as HTMLElement;
+      // If the user touches any interactive node, manual, form input, or buttons, allow standard interaction
+      if (
+        target.closest(".interactive-note") || 
+        target.closest(".wall-ui-element") ||
+        target.closest("button") ||
+        target.closest("textarea") ||
+        target.closest("input")
+      ) {
+        return; 
+      }
+
+      // Prevent page-level gestures (pull-to-refresh, safari page zoom) on the background canvas
+      e.preventDefault();
+
+      if (e.touches.length === 1) {
+        // Dragging/Panning mode
+        isTouchDraggingRef.current = true;
+        isPinchingRef.current = false;
+        const touch = e.touches[0];
+        touchStartRef.current = { x: touch.clientX, y: touch.clientY };
+        touchStartOffsetRef.current = { x: offsetXRef.current, y: offsetYRef.current };
+      } else if (e.touches.length === 2) {
+        // Pinch-to-zoom mode
+        isTouchDraggingRef.current = false;
+        isPinchingRef.current = true;
+        
+        const touch1 = e.touches[0];
+        const touch2 = e.touches[1];
+        const dx = touch1.clientX - touch2.clientX;
+        const dy = touch1.clientY - touch2.clientY;
+        initialPinchDistanceRef.current = Math.sqrt(dx * dx + dy * dy);
+        initialPinchScaleRef.current = scaleRef.current;
+      }
+    };
+
+    const handleTouchMoveNative = (e: TouchEvent) => {
+      const target = e.target as HTMLElement;
+      if (
+        target.closest(".interactive-note") || 
+        target.closest(".wall-ui-element") ||
+        target.closest("button") ||
+        target.closest("textarea") ||
+        target.closest("input")
+      ) {
+        return; 
+      }
+
+      e.preventDefault();
+
+      if (e.touches.length === 1 && isTouchDraggingRef.current) {
+        const touch = e.touches[0];
+        const dx = touch.clientX - touchStartRef.current.x;
+        const dy = touch.clientY - touchStartRef.current.y;
+        
+        const s = scaleRef.current;
+        offsetXRef.current = Math.round(touchStartOffsetRef.current.x - dx / s);
+        offsetYRef.current = Math.round(touchStartOffsetRef.current.y - dy / s);
+        
+        requestUpdate();
+      } else if (e.touches.length === 2 && isPinchingRef.current) {
+        const touch1 = e.touches[0];
+        const touch2 = e.touches[1];
+        const dx = touch1.clientX - touch2.clientX;
+        const dy = touch1.clientY - touch2.clientY;
+        const currentDistance = Math.sqrt(dx * dx + dy * dy);
+        
+        if (initialPinchDistanceRef.current > 10) {
+          const factor = currentDistance / initialPinchDistanceRef.current;
+          // Apply strict zoom limits to prevent camera clipping
+          const newScale = Math.min(Math.max(initialPinchScaleRef.current * factor, MIN_SCALE), MAX_SCALE);
+          scaleRef.current = newScale;
+          
+          requestUpdate();
+        }
+      }
+    };
+
+    const handleTouchEndNative = (e: TouchEvent) => {
+      // Commit final drag/pinch position/scale to React state once gesture concludes
+      if (isTouchDraggingRef.current || isPinchingRef.current) {
+        setOffsetX(offsetXRef.current);
+        setOffsetY(offsetYRef.current);
+        setScale(scaleRef.current);
+      }
+      
+      isTouchDraggingRef.current = false;
+      isPinchingRef.current = false;
+    };
+
+    container.addEventListener("touchstart", handleTouchStartNative, { passive: false });
+    container.addEventListener("touchmove", handleTouchMoveNative, { passive: false });
+    container.addEventListener("touchend", handleTouchEndNative, { passive: false });
+    container.addEventListener("touchcancel", handleTouchEndNative, { passive: false });
+
+    return () => {
+      container.removeEventListener("touchstart", handleTouchStartNative);
+      container.removeEventListener("touchmove", handleTouchMoveNative);
+      container.removeEventListener("touchend", handleTouchEndNative);
+      container.removeEventListener("touchcancel", handleTouchEndNative);
+      if (animationFrameId) cancelAnimationFrame(animationFrameId);
+    };
+  }, []);
 
   // DOUBLE CLICK - Create a Note
   const handleDoubleClick = (e: React.MouseEvent) => {
@@ -749,14 +897,11 @@ export default function CanvasWall({
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
-        onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
         onDoubleClick={handleDoubleClick}
         className={`absolute inset-0 w-full h-full ${
           isDragging ? "cursor-grabbing" : "cursor-grab"
         }`}
-        style={{ zIndex: 1 }}
+        style={{ zIndex: 1, touchAction: "none" }}
       >
         <div
           id="pared-canvas"

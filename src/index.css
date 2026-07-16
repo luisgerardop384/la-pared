@@ -6,6 +6,17 @@
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
 }
 
+/* Prevent browser elastic bounce, overscroll refresh, and standard page zoom on touch */
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+  -webkit-overflow-scrolling: touch;
+}
+
 /* Elegant Light design classes */
 .gallery-ui {
   background: rgba(255, 255, 255, 0.9);
