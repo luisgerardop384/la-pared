@@ -193,8 +193,9 @@ export default function CanvasWall({
         }
       }
     } catch (err) {
-      console.warn("Error cargando notas desde Supabase, intentando fallback de la API:", err);
-    }
+  console.error("DEBUG SUPABASE:", err);
+  alert("Error: " + JSON.stringify(err));
+}
 
     // Fallback a la API de Express local
     try {
