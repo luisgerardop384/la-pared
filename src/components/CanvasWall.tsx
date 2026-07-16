@@ -227,18 +227,18 @@ export default function CanvasWall({
         localStorage.clear();
 
         try {
-          // 2. Enviar petición rápida a endpoint de backend
-          const res = await fetch("/api/dev/limpiar", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-          });
+          // 2. Enviar petición de borrado directa a Supabase
+          if (supabase) {
+            const { error } = await supabase
+              .from('notas')
+              .delete()
+              .neq('id', 0);
 
-          if (res.ok) {
-            console.log("La Pared ha sido reiniciada con éxito.");
-          } else {
-            console.error("Error al reiniciar La Pared en el servidor.");
+            if (error) {
+              console.error("Error al reiniciar La Pared en Supabase:", error);
+            } else {
+              console.log("La Pared ha sido reiniciada con éxito.");
+            }
           }
         } catch (err) {
           console.error("Error de red al intentar reiniciar La Pared:", err);
