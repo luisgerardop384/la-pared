@@ -167,22 +167,45 @@ export default function CanvasWall({
     const maxY = Math.round(curY + padY);
 
     try {
-  const { data, error } = await supabase
-    .from('notas') // Asegúrate de que tu tabla en Supabase se llame exactamente 'notas'
-    .select('*')
-    .gte('x', minX)
-    .lte('x', maxX)
-    .gte('y', minY)
-    .lte('y', maxY);
+      if (supabase) {
+        const { data, error } = await supabase
+          .from('notas') // Asegúrate de que tu tabla en Supabase se llame exactamente 'notas'
+          .select('*')
+          .gte('x', minX)
+          .lte('x', maxX)
+          .gte('y', minY)
+          .lte('y', maxY);
 
-  if (error) throw error;
+        if (error) throw error;
 
-  if (data) {
-    setNotes(data);
-  }
-} catch (err) {
-  console.error("Error cargando notas desde Supabase:", err);
-}
+        if (data) {
+          const mapped = data.map((n: any) => ({
+            _id: n.id,
+            text: n.texto || n.text || "",
+            x: n.x,
+            y: n.y,
+            color: n.color || "#ffffff",
+            fontFamily: n.fuente || n.fontFamily || "Georgia",
+            createdAt: n.created_at || n.createdAt || new Date().toISOString(),
+          }));
+          setNotes(mapped);
+          return;
+        }
+      }
+    } catch (err) {
+      console.warn("Error cargando notas desde Supabase, intentando fallback de la API:", err);
+    }
+
+    // Fallback a la API de Express local
+    try {
+      const res = await fetch(`/api/notes?minX=${minX}&maxX=${maxX}&minY=${minY}&maxY=${maxY}`);
+      if (res.ok) {
+        const data = await res.json();
+        setNotes(data);
+      }
+    } catch (err) {
+      console.error("Error cargando notas desde la API local:", err);
+    }
   };
 
   // Fetch when panning, resizing, or zooming
