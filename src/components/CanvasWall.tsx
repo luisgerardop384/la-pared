@@ -193,19 +193,7 @@ export default function CanvasWall({
         }
       }
     } catch (err) {
-  console.error("DEBUG SUPABASE:", err);
-  alert("Error: " + JSON.stringify(err));
-}
-
-    // Fallback a la API de Express local
-    try {
-      const res = await fetch(`/api/notes?minX=${minX}&maxX=${maxX}&minY=${minY}&maxY=${maxY}`);
-      if (res.ok) {
-        const data = await res.json();
-        setNotes(data);
-      }
-    } catch (err) {
-      console.error("Error cargando notas desde la API local:", err);
+      console.error("Error cargando notas desde Supabase:", err);
     }
   };
 
@@ -225,57 +213,6 @@ export default function CanvasWall({
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, width, height);
   }, [offsetX, offsetY, width, height, notes]);
-
-  // Secret Dev Reset Key Listener (v + b + n)
-  useEffect(() => {
-    const keysPressed = new Set<string>();
-
-    const handleKeyDown = async (e: KeyboardEvent) => {
-      const key = e.key.toLowerCase();
-      keysPressed.add(key);
-
-      if (keysPressed.has("v") && keysPressed.has("b") && keysPressed.has("n")) {
-        keysPressed.clear();
-        console.log("¡Combinación secreta v+b+n detectada! Ejecutando Reset de Pruebas...");
-
-        // 1. Borrar localStorage
-        localStorage.clear();
-
-        try {
-          // 2. Enviar petición rápida a endpoint de backend
-          const res = await fetch("/api/dev/limpiar", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-          });
-
-          if (res.ok) {
-            console.log("La Pared ha sido reiniciada con éxito.");
-          } else {
-            console.error("Error al reiniciar La Pared en el servidor.");
-          }
-        } catch (err) {
-          console.error("Error de red al intentar reiniciar La Pared:", err);
-        } finally {
-          // 3. Refrescar la página automáticamente
-          window.location.reload();
-        }
-      }
-    };
-
-    const handleKeyUp = (e: KeyboardEvent) => {
-      keysPressed.delete(e.key.toLowerCase());
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    window.addEventListener("keyup", handleKeyUp);
-
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-      window.removeEventListener("keyup", handleKeyUp);
-    };
-  }, []);
 
   // DRAG & PAN EVENTS
   const handleMouseDown = (e: React.MouseEvent) => {
@@ -360,7 +297,6 @@ export default function CanvasWall({
     if (!creatingNote || !creatingNote.text.trim()) return;
 
     const textTrimmed = creatingNote.text.trim();
-    const isAdmin = textTrimmed.startsWith("admin123");
 
     // Strict character limit check
     if (textTrimmed.length > 50) {
@@ -368,14 +304,11 @@ export default function CanvasWall({
       return;
     }
 
-    // Extra double-check for limit before saving (bypass for admin)
-    if (!isAdmin) {
-      const hasPosted = localStorage.getItem("lapared_has_posted") === "true";
-      if (hasPosted) {
-        setShowLimitAlert(true);
-        setCreatingNote(null);
-        return;
-      }
+    const hasPosted = localStorage.getItem("lapared_has_posted") === "true";
+    if (hasPosted) {
+      setShowLimitAlert(true);
+      setCreatingNote(null);
+      return;
     }
 
     setSaving(true);
@@ -386,38 +319,37 @@ export default function CanvasWall({
     const finalY = Math.round(creatingNote.y);
 
     try {
-      const res = await fetch("/api/notes", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-client-id": clientId,
-        },
-        body: JSON.stringify({
-          text: creatingNote.text,
+      const { data, error } = await supabase
+        .from("notas")
+        .insert({
+          texto: textTrimmed,
           x: finalX,
           y: finalY,
+          client_id: clientId,
           color: creatingNote.color,
-          fontFamily: creatingNote.fontFamily,
-        }),
-      });
+          fuente: creatingNote.fontFamily,
+        })
+        .select()
+        .single();
 
-      const data = await res.json();
-
-      if (!res.ok) {
-        throw new Error(data.error || "No se pudo grabar la inscripción.");
+      if (error) {
+        if (error.code === "23505") {
+          throw new Error("Ya has dejado tu huella en La Pared. Solo se permite una inscripción por persona.");
+        }
+        throw new Error(error.message || "No se pudo grabar la inscripción.");
       }
 
-      // Asegurar que el objeto de nota guardado localmente refleje las coordenadas finales sin encimarse
       const finalNote = {
-        ...data,
-        x: finalX,
-        y: finalY
+        _id: data.id,
+        text: data.texto,
+        x: data.x,
+        y: data.y,
+        color: data.color || "#ffffff",
+        fontFamily: data.fuente || "Georgia",
+        createdAt: data.created_at,
       };
 
-      // Mark as posted in localStorage ONLY if NOT admin
-      if (!isAdmin) {
-        localStorage.setItem("lapared_has_posted", "true");
-      }
+      localStorage.setItem("lapared_has_posted", "true");
 
       // Add to local state immediately
       setNotes((prev) => [finalNote, ...prev]);
