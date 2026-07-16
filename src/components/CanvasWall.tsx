@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Compass, Plus, Sparkles, HelpCircle, X, Download } from "lucide-react";
 import { Note } from "../types";
+import { supabase } from '../supabaseClient';
 
 interface CanvasWallProps {
   clientId: string;
@@ -166,14 +167,22 @@ export default function CanvasWall({
     const maxY = Math.round(curY + padY);
 
     try {
-      const res = await fetch(`/api/notes?minX=${minX}&maxX=${maxX}&minY=${minY}&maxY=${maxY}`);
-      if (res.ok) {
-        const data = await res.json();
-        setNotes(data);
-      }
-    } catch (err) {
-      console.error("Error cargando notas:", err);
-    }
+  const { data, error } = await supabase
+    .from('notas') // Asegúrate de que tu tabla en Supabase se llame exactamente 'notas'
+    .select('*')
+    .gte('x', minX)
+    .lte('x', maxX)
+    .gte('y', minY)
+    .lte('y', maxY);
+
+  if (error) throw error;
+
+  if (data) {
+    setNotes(data);
+  }
+} catch (err) {
+  console.error("Error cargando notas desde Supabase:", err);
+}
   };
 
   // Fetch when panning, resizing, or zooming
