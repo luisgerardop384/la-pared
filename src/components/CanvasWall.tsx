@@ -238,26 +238,29 @@ export default function CanvasWall({
         console.log("¡Combinación secreta v+b+n detectada! Ejecutando Reset de Pruebas...");
 
         try {
-          const response = await fetch("/api/admin/clear-notes", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({ password }),
+          const { data, error } = await supabase.functions.invoke("admin-note", {
+            body: { action: "clear", password }
           });
 
-          const result = await response.json();
+          if (error) {
+            console.error("Error al invocar admin-note para borrar:", error);
+            alert("No se pudo contactar con la función de administración o la contraseña es incorrecta.");
+            return;
+          }
 
-          if (!response.ok) {
-            console.error("Error al reiniciar La Pared:", result.error || "No autorizado");
+          if (data && data.error) {
+            console.error("Error al reiniciar La Pared:", data.error);
+            alert(`Error: ${data.error}`);
             return;
           }
 
           localStorage.clear();
           console.log("La Pared ha sido reiniciada con éxito.");
           setNotes([]);
+          alert("La Pared ha sido reiniciada con éxito.");
         } catch (err) {
           console.error("Error de red al intentar reiniciar La Pared:", err);
+          alert("Error de red al intentar reiniciar La Pared.");
         }
       }
     };
@@ -551,57 +554,93 @@ export default function CanvasWall({
     const finalY = Math.round(creatingNote.y);
 
     try {
-      const response = await fetch("/api/notas", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
+      // Invocar la Edge Function admin-note
+      const { data: invokeData, error: invokeError } = await supabase.functions.invoke("admin-note", {
+        body: {
           texto: textTrimmed,
           x: finalX,
           y: finalY,
-          client_id: clientId,
           color: creatingNote.color,
           fuente: creatingNote.fontFamily || 'Georgia',
-        }),
+          client_id: clientId
+        }
       });
 
-      const result = await response.json();
+      if (invokeError) {
+        console.warn("La Edge Function 'admin-note' falló o no está desplegada:", invokeError);
+        throw new Error("No se pudo contactar con la función administrativa 'admin-note'. Asegúrate de que esté desplegada y de configurar ADMIN_PASSWORD en Supabase.");
+      }
 
-      if (!response.ok) {
-        if (result.limitExceeded) {
+      if (invokeData && invokeData.error) {
+        throw new Error(invokeData.error);
+      }
+
+      if (invokeData && invokeData.isAdmin) {
+        // Si responde: { isAdmin: true } el frontend únicamente debe refrescar la pared.
+        await fetchNotesInViewport(offsetX, offsetY, width, height, scale);
+        setCreatingNote(null);
+      } else if (invokeData && invokeData.isNormal) {
+        // Tratar como nota normal con la lógica de inserción normal del frontend
+        const hasPosted = localStorage.getItem("lapared_has_posted") === "true";
+        if (hasPosted) {
           setShowLimitAlert(true);
-          localStorage.setItem("lapared_has_posted", "true");
           setCreatingNote(null);
           return;
         }
-        throw new Error(result.error || "Error al grabar la inscripción en La Pared.");
-      }
 
-      const savedNote = result.data;
-      const finalNote: Note = {
-        _id: String(savedNote.id),
-        text: savedNote.texto || "",
-        x: Number(savedNote.x),
-        y: Number(savedNote.y),
-        color: savedNote.color || "#ffffff",
-        fontFamily: savedNote.fuente || "Georgia",
-        createdAt: savedNote.created_at || new Date().toISOString(),
-      };
+        const { data: normalData, error: normalError } = await supabase
+          .from('notas')
+          .insert([
+            {
+              texto: textTrimmed,
+              x: finalX,
+              y: finalY,
+              client_id: clientId,
+              color: creatingNote.color,
+              fuente: creatingNote.fontFamily || 'Georgia',
+            }
+          ])
+          .select();
 
-      // Mark as posted in localStorage ONLY if NOT admin
-      if (!result.isAdmin) {
+        if (normalError) {
+          if (normalError.code === '23505') {
+            setShowLimitAlert(true);
+            localStorage.setItem("lapared_has_posted", "true");
+            setCreatingNote(null);
+            return;
+          }
+          throw new Error(normalError.message || "Error al grabar la inscripción.");
+        }
+
+        if (!normalData || normalData.length === 0) {
+          throw new Error("No se pudo obtener la nota grabada de Supabase.");
+        }
+
+        const savedNote = normalData[0];
+        const finalNote: Note = {
+          _id: String(savedNote.id),
+          text: savedNote.texto || "",
+          x: Number(savedNote.x),
+          y: Number(savedNote.y),
+          color: savedNote.color || "#ffffff",
+          fontFamily: savedNote.fuente || "Georgia",
+          createdAt: savedNote.created_at || new Date().toISOString(),
+        };
+
+        // Mark as posted in localStorage
         localStorage.setItem("lapared_has_posted", "true");
+
+        // Add to local state immediately
+        setNotes((prev) => [finalNote, ...prev]);
+
+        // Automatically generate PNG photo with exact coordinates and download
+        generateAndDownloadPhoto(finalNote);
+
+        // Reset state
+        setCreatingNote(null);
+      } else {
+        throw new Error("Respuesta inválida o desconocida de la Edge Function.");
       }
-
-      // Add to local state immediately
-      setNotes((prev) => [finalNote, ...prev]);
-
-      // Automatically generate PNG photo with exact coordinates and download
-      generateAndDownloadPhoto(finalNote);
-
-      // Reset state
-      setCreatingNote(null);
     } catch (err: any) {
       setSavingError(err.message || "Error al grabar la inscripción en La Pared.");
     } finally {
