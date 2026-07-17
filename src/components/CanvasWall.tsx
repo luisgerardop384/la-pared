@@ -692,7 +692,7 @@ export default function CanvasWall({
     ctx.textAlign = "right";
     ctx.font = "bold 14px monospace";
     ctx.fillStyle = "#000000";
-    ctx.fillText(`COORDS: X: ${newNote.x.toLocaleString()}  |  Y: ${newNote.y.toLocaleString()}`, 755, 520);
+    ctx.fillText(`COORDS: X: ${newNote.x.toLocaleString()}  |  Y: ${(-newNote.y).toLocaleString()}`, 755, 520);
 
     ctx.font = "10px monospace";
     ctx.fillStyle = "#a3a3a3";
@@ -702,7 +702,7 @@ export default function CanvasWall({
     // 5. Download Trigger
     const dataURL = exportCanvas.toDataURL("image/png");
     const link = document.createElement("a");
-    link.download = `lapared_inscripcion_${newNote.x}_${newNote.y}.png`;
+    link.download = `lapared_inscripcion_${newNote.x}_${-newNote.y}.png`;
     link.href = dataURL;
     link.click();
   };
@@ -860,7 +860,7 @@ export default function CanvasWall({
 
     // Right side: Exact coordinates
     ctx.textAlign = "right";
-    ctx.fillText(`X: ${n.x} | Y: ${n.y}`, x + w - paddingLeftRight, y + h - barHeight / 2);
+    ctx.fillText(`X: ${n.x} | Y: ${-n.y}`, x + w - paddingLeftRight, y + h - barHeight / 2);
 
     ctx.restore();
   };
@@ -906,7 +906,7 @@ export default function CanvasWall({
                 Coordenadas
               </span>
               <span className="text-xs font-mono font-bold text-black mt-1">
-                X: {offsetX.toLocaleString()} <span className="text-neutral-300 mx-1">|</span> Y: {offsetY.toLocaleString()}
+                X: {offsetX.toLocaleString()} <span className="text-neutral-300 mx-1">|</span> Y: {(-offsetY).toLocaleString()}
               </span>
             </div>
             <div className="w-px h-6 bg-neutral-200" />
@@ -1024,7 +1024,7 @@ export default function CanvasWall({
                 {/* Position stamp */}
                 <div className="pt-1.5 md:pt-2 border-t border-black/10 flex items-center justify-between text-[7px] md:text-[8px] font-mono text-neutral-400">
                   <span className="font-bold tracking-wider text-black">LA PARED</span>
-                  <span>X:{note.x} Y:{note.y}</span>
+                  <span>X:{note.x} Y:{-note.y}</span>
                 </div>
               </div>
             );
@@ -1048,7 +1048,7 @@ export default function CanvasWall({
           >
             <div className="flex items-center justify-between mb-2 pb-2 border-b border-neutral-100 text-[9px] font-mono text-neutral-400">
               <span className="font-bold uppercase tracking-widest text-black">Nueva Inscripción</span>
-              <span>X:{creatingNote.x} Y:{creatingNote.y}</span>
+              <span>X:{creatingNote.x} Y:{-creatingNote.y}</span>
             </div>
 
             <textarea
@@ -1160,7 +1160,6 @@ export default function CanvasWall({
         style={{ zIndex: 20 }}
       >
         <span>100% Anónimo & Libre</span>
-        <span>Supabase DB</span>
       </div>
 
       {/* Floating Action Button (FAB) for Manual */}
