@@ -231,28 +231,31 @@ export default function CanvasWall({
         keysPressed.clear();
         
         const password = window.prompt("Introduce la contraseña de administrador para borrar todas las notas:");
-        if (password !== "admin123") {
+        if (!password) {
           return;
         }
 
         console.log("¡Combinación secreta v+b+n detectada! Ejecutando Reset de Pruebas...");
 
-        localStorage.clear();
-
         try {
-          if (supabase) {
-            const { error } = await supabase
-              .from('notas')
-              .delete()
-              .neq('id', 0);
+          const response = await fetch("/api/admin/clear-notes", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ password }),
+          });
 
-            if (error) {
-              console.error("Error al reiniciar La Pared en Supabase:", error);
-            } else {
-              console.log("La Pared ha sido reiniciada con éxito.");
-              setNotes([]);
-            }
+          const result = await response.json();
+
+          if (!response.ok) {
+            console.error("Error al reiniciar La Pared:", result.error || "No autorizado");
+            return;
           }
+
+          localStorage.clear();
+          console.log("La Pared ha sido reiniciada con éxito.");
+          setNotes([]);
         } catch (err) {
           console.error("Error de red al intentar reiniciar La Pared:", err);
         }
@@ -533,22 +536,11 @@ export default function CanvasWall({
     if (!creatingNote || !creatingNote.text.trim()) return;
 
     const textTrimmed = creatingNote.text.trim();
-    const isAdmin = textTrimmed.startsWith("admin123");
 
-    // Strict character limit check
-    if (textTrimmed.length > 50) {
+    // Strict character limit check (expanded on the frontend to allow password prefix)
+    if (textTrimmed.length > 100) {
       setSavingError("La inscripción no puede exceder los 50 caracteres.");
       return;
-    }
-
-    // Extra double-check for limit before saving (bypass for admin)
-    if (!isAdmin) {
-      const hasPosted = localStorage.getItem("lapared_has_posted") === "true";
-      if (hasPosted) {
-        setShowLimitAlert(true);
-        setCreatingNote(null);
-        return;
-      }
     }
 
     setSaving(true);
@@ -559,61 +551,34 @@ export default function CanvasWall({
     const finalY = Math.round(creatingNote.y);
 
     try {
-      if (!supabase) {
-        throw new Error("Supabase is not configured.");
-      }
+      const response = await fetch("/api/notas", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          texto: textTrimmed,
+          x: finalX,
+          y: finalY,
+          client_id: clientId,
+          color: creatingNote.color,
+          fuente: creatingNote.fontFamily || 'Georgia',
+        }),
+      });
 
-      // Check if client_id already exists in Supabase to show the proper alert
-      if (!isAdmin) {
-        const { data: existingNotes, error: checkError } = await supabase
-          .from('notas')
-          .select('id')
-          .eq('client_id', clientId);
+      const result = await response.json();
 
-        if (checkError) {
-          console.warn("Error checking existing notes:", checkError);
-        } else if (existingNotes && existingNotes.length > 0) {
-          setShowLimitAlert(true);
-          setCreatingNote(null);
-          localStorage.setItem("lapared_has_posted", "true");
-          return;
-        }
-      }
-
-      const uniqueClientId = isAdmin 
-        ? "admin_" + Math.random().toString(36).substring(2, 10) + "_" + Date.now() 
-        : clientId;
-
-      const { data, error } = await supabase
-        .from('notas')
-        .insert([
-          {
-            texto: textTrimmed,
-            x: finalX,
-            y: finalY,
-            client_id: uniqueClientId,
-            color: creatingNote.color,
-            fuente: creatingNote.fontFamily || 'Georgia',
-          }
-        ])
-        .select();
-
-      if (error) {
-        // Handle specific unique constraint error (postgres code '23505')
-        if (error.code === '23505') {
+      if (!response.ok) {
+        if (result.limitExceeded) {
           setShowLimitAlert(true);
           localStorage.setItem("lapared_has_posted", "true");
           setCreatingNote(null);
           return;
         }
-        throw error;
+        throw new Error(result.error || "Error al grabar la inscripción en La Pared.");
       }
 
-      if (!data || data.length === 0) {
-        throw new Error("No se pudo obtener la nota grabada de Supabase.");
-      }
-
-      const savedNote = data[0];
+      const savedNote = result.data;
       const finalNote: Note = {
         _id: String(savedNote.id),
         text: savedNote.texto || "",
@@ -625,7 +590,7 @@ export default function CanvasWall({
       };
 
       // Mark as posted in localStorage ONLY if NOT admin
-      if (!isAdmin) {
+      if (!result.isAdmin) {
         localStorage.setItem("lapared_has_posted", "true");
       }
 
@@ -1058,11 +1023,11 @@ export default function CanvasWall({
               value={creatingNote.text}
               onChange={(e) => {
                 const val = e.target.value;
-                if (val.length <= 50) {
+                if (val.length <= 100) {
                   setCreatingNote((prev) => prev && { ...prev, text: val });
                 }
               }}
-              maxLength={50}
+              maxLength={100}
               className="bg-neutral-50 border border-neutral-200 focus:border-black outline-none p-3 text-xs text-black placeholder-neutral-400 flex-1 resize-none mb-1 focus:ring-0"
               style={{
                 fontFamily: creatingNote.fontFamily,
