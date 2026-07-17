@@ -219,18 +219,27 @@ export default function CanvasWall({
     const keysPressed = new Set<string>();
 
     const handleKeyDown = async (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) {
+        return;
+      }
+
       const key = e.key.toLowerCase();
       keysPressed.add(key);
 
       if (keysPressed.has("v") && keysPressed.has("b") && keysPressed.has("n")) {
         keysPressed.clear();
+        
+        const password = window.prompt("Introduce la contraseña de administrador para borrar todas las notas:");
+        if (password !== "admin123") {
+          return;
+        }
+
         console.log("¡Combinación secreta v+b+n detectada! Ejecutando Reset de Pruebas...");
 
-        // 1. Borrar localStorage
         localStorage.clear();
 
         try {
-          // 2. Enviar petición de borrado directa a Supabase
           if (supabase) {
             const { error } = await supabase
               .from('notas')
@@ -241,13 +250,11 @@ export default function CanvasWall({
               console.error("Error al reiniciar La Pared en Supabase:", error);
             } else {
               console.log("La Pared ha sido reiniciada con éxito.");
+              setNotes([]);
             }
           }
         } catch (err) {
           console.error("Error de red al intentar reiniciar La Pared:", err);
-        } finally {
-          // 3. Refrescar la página automáticamente
-          window.location.reload();
         }
       }
     };
