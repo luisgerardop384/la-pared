@@ -298,6 +298,10 @@ export default function CanvasWall({
   const initialPinchDistanceRef = useRef(0);
   const initialPinchScaleRef = useRef(1.0);
 
+  // Double-tap tracking refs
+  const lastTouchTimeRef = useRef<number>(0);
+  const lastTouchPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+
   // Sync state values with refs to prevent stale state closures in native listeners
   const offsetXRef = useRef(offsetX);
   const offsetYRef = useRef(offsetY);
@@ -321,6 +325,36 @@ export default function CanvasWall({
     widthRef.current = width;
     heightRef.current = height;
   }, [width, height]);
+
+  // Generic helper to trigger note creation at a screen coordinate (clientX, clientY)
+  const triggerCreateNote = (clientX: number, clientY: number) => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    const relativeX = clientX - rect.left;
+    const relativeY = clientY - rect.top;
+
+    // Direct, exact Screen-to-World mapping formula using current refs to avoid state lag
+    const currentScale = scaleRef.current;
+    const currentOffsetX = offsetXRef.current;
+    const currentOffsetY = offsetYRef.current;
+
+    const actualX = (relativeX - rect.width / 2) / currentScale + currentOffsetX;
+    const actualY = (relativeY - rect.height / 2) / currentScale + currentOffsetY;
+
+    const posicionFinal = calcularPosicionFinal(actualX, actualY, notes);
+
+    setCreatingNote({
+      x: posicionFinal.x,
+      y: posicionFinal.y,
+      canvasX: actualX,
+      canvasY: actualY,
+      text: "",
+      color: "#ffffff",
+      fontFamily: "Georgia, serif",
+    });
+    setSavingError("");
+  };
 
   // Native touch listener to prevent default browser overscroll refresh, elastic bounce, page zoom, and enable pinch-to-zoom
   useEffect(() => {
@@ -369,11 +403,34 @@ export default function CanvasWall({
       e.preventDefault();
 
       if (e.touches.length === 1) {
+        const touch = e.touches[0];
+        const touchX = touch.clientX;
+        const touchY = touch.clientY;
+
+        const now = Date.now();
+        const lastTouchTime = lastTouchTimeRef.current;
+        const lastTouchPos = lastTouchPosRef.current;
+        const delay = now - lastTouchTime;
+        const dist = Math.sqrt((touchX - lastTouchPos.x) ** 2 + (touchY - lastTouchPos.y) ** 2);
+
+        if (delay < 300 && dist < 30) {
+          // Double-tap detected!
+          // Reset tracker to prevent cascading/triple taps
+          lastTouchTimeRef.current = 0;
+          isTouchDraggingRef.current = false;
+          isPinchingRef.current = false;
+          
+          triggerCreateNote(touchX, touchY);
+          return;
+        }
+
+        lastTouchTimeRef.current = now;
+        lastTouchPosRef.current = { x: touchX, y: touchY };
+
         // Dragging/Panning mode
         isTouchDraggingRef.current = true;
         isPinchingRef.current = false;
-        const touch = e.touches[0];
-        touchStartRef.current = { x: touch.clientX, y: touch.clientY };
+        touchStartRef.current = { x: touchX, y: touchY };
         touchStartOffsetRef.current = { x: offsetXRef.current, y: offsetYRef.current };
       } else if (e.touches.length === 2) {
         // Pinch-to-zoom mode
@@ -461,31 +518,7 @@ export default function CanvasWall({
   const handleDoubleClick = (e: React.MouseEvent) => {
     const target = e.target as HTMLElement;
     if (target.closest(".interactive-note") || target.closest(".wall-ui-element")) return;
-
-    const rect = containerRef.current?.getBoundingClientRect();
-    if (!rect) return;
-
-    const clientX = e.clientX - rect.left;
-    const clientY = e.clientY - rect.top;
-
-    // Direct, exact Screen-to-World mapping formula:
-    // P_world = (P_screen - center) / scale + offset
-    const actualX = (clientX - rect.width / 2) / scale + offsetX;
-    const actualY = (clientY - rect.height / 2) / scale + offsetY;
-
-    // 2. Pasar estas coordenadas ajustadas a tu sistema de cuadrícula/colisiones
-    const posicionFinal = calcularPosicionFinal(actualX, actualY, notes);
-
-    setCreatingNote({
-      x: posicionFinal.x,
-      y: posicionFinal.y,
-      canvasX: actualX,
-      canvasY: actualY,
-      text: "",
-      color: "#ffffff",
-      fontFamily: "Georgia, serif",
-    });
-    setSavingError("");
+    triggerCreateNote(e.clientX, e.clientY);
   };
 
   // SAVE NOTE TO WALL (Engrave)
@@ -836,6 +869,7 @@ export default function CanvasWall({
   };
 
   const isMobile = width < 768;
+  const isTabletOrMobile = width < 1024;
 
   return (
     <div className="relative w-full h-full bg-white overflow-hidden select-none">
@@ -1125,8 +1159,11 @@ export default function CanvasWall({
       {/* Floating Action Button (FAB) for Manual */}
       <button
         onClick={() => setIsManualOpen(true)}
-        className="wall-ui-element absolute bottom-10 right-6 w-11 h-11 rounded-full bg-white border border-neutral-300 hover:border-black shadow-[2px_2px_4px_rgba(0,0,0,0.1)] hover:shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] flex items-center justify-center text-sm font-mono font-bold text-black transition-all hover:scale-105 active:scale-95 cursor-pointer"
-        style={{ zIndex: 25 }}
+        className="wall-ui-element absolute right-6 w-11 h-11 rounded-full bg-white border border-neutral-300 hover:border-black shadow-[2px_2px_4px_rgba(0,0,0,0.1)] hover:shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] flex items-center justify-center text-sm font-mono font-bold text-black transition-all hover:scale-105 active:scale-95 cursor-pointer"
+        style={{ 
+          zIndex: 25,
+          bottom: isTabletOrMobile ? "calc(env(safe-area-inset-bottom) + 5.5rem)" : "2.5rem"
+        }}
         title="Manual de La Pared"
       >
         <HelpCircle className="w-5 h-5 text-black" />
