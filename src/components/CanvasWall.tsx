@@ -19,6 +19,7 @@ const NOTE_COLORS = [
   { name: "Rosa pálido", hex: "#fbcfe8" },
   { name: "Naranja pálido", hex: "#fed7aa" },
   { name: "Gris pálido", hex: "#f3f4f6" },
+  { name: "Morado pastel", hex: "#DCC6F8" },
   { name: "Sombra", hex: "#171717" },
 ];
 
@@ -1026,8 +1027,8 @@ export default function CanvasWall({
                 </p>
 
                 {/* Position stamp */}
-                <div className="pt-1.5 md:pt-2 border-t border-black/10 flex items-center justify-between text-[7px] md:text-[8px] font-mono text-neutral-400">
-                  <span className="font-bold tracking-wider text-black">LA PARED</span>
+                <div className={`pt-1.5 md:pt-2 border-t ${(note.color === "#171717" || note.color === "#000000") ? "border-white/10" : "border-black/10"} flex items-center justify-between text-[7px] md:text-[8px] font-mono ${(note.color === "#171717" || note.color === "#000000") ? "text-neutral-400" : "text-neutral-400"}`}>
+                  <span className={`font-bold tracking-wider ${(note.color === "#171717" || note.color === "#000000") ? "text-white" : "text-black"}`}>LA PARED</span>
                   <span>X:{note.x} Y:{-note.y}</span>
                 </div>
               </div>
@@ -1172,7 +1173,7 @@ export default function CanvasWall({
         className="wall-ui-element absolute right-6 w-11 h-11 rounded-full bg-white border border-neutral-300 hover:border-black shadow-[2px_2px_4px_rgba(0,0,0,0.1)] hover:shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] flex items-center justify-center text-sm font-mono font-bold text-black transition-all hover:scale-105 active:scale-95 cursor-pointer"
         style={{ 
           zIndex: 25,
-          bottom: isTabletOrMobile ? "calc(env(safe-area-inset-bottom) + 5.5rem)" : "2.5rem"
+          bottom: isTabletOrMobile ? "calc(env(safe-area-inset-bottom) + 5.5rem + 50px)" : "2.5rem"
         }}
         title="Manual de La Pared"
       >

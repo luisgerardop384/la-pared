@@ -93,7 +93,7 @@ export default function NoteDetailsModal({ note, onClose }: NoteDetailsModalProp
             className="text-lg leading-relaxed font-light"
             style={{
               fontFamily: note.fontFamily || "Georgia",
-              color: note.color === "#000000" ? "#ffffff" : "#000000",
+              color: (note.color === "#171717" || note.color === "#000000") ? "#ffffff" : "#000000",
               wordBreak: "break-all",
               overflowWrap: "break-word",
               whiteSpace: "pre-wrap",
