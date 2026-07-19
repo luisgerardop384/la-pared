@@ -94,7 +94,7 @@ export default function NoteDetailsModal({ note, onClose }: NoteDetailsModalProp
             style={{
               fontFamily: note.fontFamily || "Georgia",
               color: (note.color === "#171717" || note.color === "#000000") ? "#ffffff" : "#000000",
-              wordBreak: "break-all",
+              wordBreak: "normal",
               overflowWrap: "break-word",
               whiteSpace: "pre-wrap",
               maxWidth: "100%",

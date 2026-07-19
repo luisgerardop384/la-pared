@@ -1005,7 +1005,7 @@ export default function CanvasWall({
                   willChange: "transform",
                   zIndex: zIndex,
                   overflowWrap: "break-word",
-                  wordBreak: "break-all",
+                  wordBreak: "normal",
                   whiteSpace: "pre-wrap",
                 }}
                 onMouseEnter={() => setHoveredNoteId(note._id)}
@@ -1017,7 +1017,7 @@ export default function CanvasWall({
                   className={`text-[11px] md:text-[13px] leading-relaxed mt-1 mb-3 flex-1 select-text ${txtColor}`}
                   style={{
                     fontFamily: note.fontFamily || "Georgia, serif",
-                    wordBreak: "break-all",
+                    wordBreak: "normal",
                     overflowWrap: "break-word",
                     whiteSpace: "pre-wrap",
                     maxWidth: "100%",
