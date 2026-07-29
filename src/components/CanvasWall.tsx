@@ -157,8 +157,21 @@ export default function CanvasWall({
     };
   }, []);
 
+  // Zone size for spatial chunk caching in memory
+  const ZONE_SIZE = 800;
+  const cachedZonesRef = useRef<Set<string>>(new Set());
+  const pendingZonesRef = useRef<Set<string>>(new Set());
+  const notesMapRef = useRef<Map<string, Note>>(new Map());
+
   // Fetch Notes in Viewport
-  const fetchNotesInViewport = async (curX: number, curY: number, viewW: number, viewH: number, curScale: number) => {
+  const fetchNotesInViewport = async (
+    curX: number,
+    curY: number,
+    viewW: number,
+    viewH: number,
+    curScale: number,
+    forceInvalidateBounds = false
+  ) => {
     // If zoomed out (low scale), the world area seen is much larger
     const worldW = viewW / curScale;
     const worldH = viewH / curScale;
@@ -170,37 +183,109 @@ export default function CanvasWall({
     const minY = Math.round(curY - padY);
     const maxY = Math.round(curY + padY);
 
+    const startZoneX = Math.floor(minX / ZONE_SIZE);
+    const endZoneX = Math.floor(maxX / ZONE_SIZE);
+    const startZoneY = Math.floor(minY / ZONE_SIZE);
+    const endZoneY = Math.floor(maxY / ZONE_SIZE);
+
+    if (forceInvalidateBounds) {
+      for (let zx = startZoneX; zx <= endZoneX; zx++) {
+        for (let zy = startZoneY; zy <= endZoneY; zy++) {
+          cachedZonesRef.current.delete(`${zx},${zy}`);
+        }
+      }
+    }
+
+    const uncachedZones: string[] = [];
+    for (let zx = startZoneX; zx <= endZoneX; zx++) {
+      for (let zy = startZoneY; zy <= endZoneY; zy++) {
+        const key = `${zx},${zy}`;
+        if (!cachedZonesRef.current.has(key) && !pendingZonesRef.current.has(key)) {
+          uncachedZones.push(key);
+        }
+      }
+    }
+
+    // If all zones in the current viewport are already cached, avoid duplicate network calls
+    if (uncachedZones.length === 0) {
+      return;
+    }
+
+    // Mark missing zones as pending to avoid duplicate concurrent requests
+    uncachedZones.forEach((key) => pendingZonesRef.current.add(key));
+
+    // Calculate bounding box covering the uncached zones
+    let qMinX = Infinity, qMaxX = -Infinity, qMinY = Infinity, qMaxY = -Infinity;
+    uncachedZones.forEach((key) => {
+      const [zxStr, zyStr] = key.split(",");
+      const zx = Number(zxStr);
+      const zy = Number(zyStr);
+      const zMinX = zx * ZONE_SIZE;
+      const zMaxX = (zx + 1) * ZONE_SIZE;
+      const zMinY = zy * ZONE_SIZE;
+      const zMaxY = (zy + 1) * ZONE_SIZE;
+
+      if (zMinX < qMinX) qMinX = zMinX;
+      if (zMaxX > qMaxX) qMaxX = zMaxX;
+      if (zMinY < qMinY) qMinY = zMinY;
+      if (zMaxY > qMaxY) qMaxY = zMaxY;
+    });
+
     try {
       const { data, error } = await supabase
-        .from('notas') // Asegúrate de que tu tabla en Supabase se llame exactamente 'notas'
-        .select('*')
-        .gte('x', minX)
-        .lte('x', maxX)
-        .gte('y', minY)
-        .lte('y', maxY);
+        .from('notas')
+        .select('id, texto, x, y, color, fuente, created_at')
+        .gte('x', qMinX)
+        .lte('x', qMaxX)
+        .gte('y', qMinY)
+        .lte('y', qMaxY);
 
-      if (error) throw error;
+      if (error) {
+        uncachedZones.forEach((key) => pendingZonesRef.current.delete(key));
+        throw error;
+      }
+
+      uncachedZones.forEach((key) => {
+        pendingZonesRef.current.delete(key);
+        cachedZonesRef.current.add(key);
+      });
 
       if (data) {
-        const mapped = data.map((n: any) => ({
-          _id: String(n.id),
-          text: n.texto || n.text || "",
-          x: n.x,
-          y: n.y,
-          color: n.color || "#ffffff",
-          fontFamily: n.fuente || n.fontFamily || "Georgia",
-          createdAt: n.created_at || n.createdAt || new Date().toISOString(),
-        }));
-        setNotes(mapped);
+        let hasNew = false;
+        data.forEach((n: any) => {
+          const id = String(n.id);
+          if (!notesMapRef.current.has(id)) {
+            hasNew = true;
+            notesMapRef.current.set(id, {
+              _id: id,
+              text: n.texto || n.text || "",
+              x: Number(n.x),
+              y: Number(n.y),
+              color: n.color || "#ffffff",
+              fontFamily: n.fuente || n.fontFamily || "Georgia",
+              createdAt: n.created_at || n.createdAt || new Date().toISOString(),
+            });
+          }
+        });
+
+        if (hasNew) {
+          setNotes(Array.from(notesMapRef.current.values()));
+        }
       }
     } catch (err) {
       console.error("Error cargando notas desde Supabase:", err);
     }
   };
 
-  // Fetch when panning, resizing, or zooming
+  // Fetch when panning, resizing, or zooming (Debounced 350ms)
   useEffect(() => {
-    fetchNotesInViewport(offsetX, offsetY, width, height, scale);
+    const timer = setTimeout(() => {
+      fetchNotesInViewport(offsetX, offsetY, width, height, scale);
+    }, 350);
+
+    return () => {
+      clearTimeout(timer);
+    };
   }, [offsetX, offsetY, width, height, scale]);
 
   // Main Canvas Render Loop - Estética Pureza Blanca (Sin Cuadrícula)
@@ -256,6 +341,9 @@ export default function CanvasWall({
           }
 
           localStorage.clear();
+          cachedZonesRef.current.clear();
+          pendingZonesRef.current.clear();
+          notesMapRef.current.clear();
           console.log("La Pared ha sido reiniciada con éxito.");
           setNotes([]);
           alert("La Pared ha sido reiniciada con éxito.");
@@ -577,6 +665,11 @@ export default function CanvasWall({
       }
 
       if (invokeData && invokeData.isAdmin) {
+        // Invalidate the zone containing the admin note so fresh data is fetched for that zone
+        const zx = Math.floor(finalX / ZONE_SIZE);
+        const zy = Math.floor(finalY / ZONE_SIZE);
+        cachedZonesRef.current.delete(`${zx},${zy}`);
+
         // Si responde: { isAdmin: true } el frontend únicamente debe refrescar la pared.
         await fetchNotesInViewport(offsetX, offsetY, width, height, scale);
         setCreatingNote(null);
@@ -631,8 +724,14 @@ export default function CanvasWall({
         // Mark as posted in localStorage
         localStorage.setItem("lapared_has_posted", "true");
 
+        // Add to memory map and cached zone
+        notesMapRef.current.set(finalNote._id, finalNote);
+        const zx = Math.floor(finalNote.x / ZONE_SIZE);
+        const zy = Math.floor(finalNote.y / ZONE_SIZE);
+        cachedZonesRef.current.add(`${zx},${zy}`);
+
         // Add to local state immediately
-        setNotes((prev) => [finalNote, ...prev]);
+        setNotes(Array.from(notesMapRef.current.values()));
 
         // Automatically generate PNG photo with exact coordinates and download
         generateAndDownloadPhoto(finalNote);
