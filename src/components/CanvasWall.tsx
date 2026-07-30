@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { Compass, Plus, Sparkles, HelpCircle, X, Download } from "lucide-react";
 import { Note } from "../types";
 import { supabase } from '../supabaseClient';
+import AmbientBackground from "./AmbientBackground";
 
 interface CanvasWallProps {
   clientId: string;
@@ -295,9 +296,8 @@ export default function CanvasWall({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    // Pure white canvas background completely liso
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, width, height);
+    // Limpiar canvas para que el fondo de ambiente sea visible
+    ctx.clearRect(0, 0, width, height);
   }, [offsetX, offsetY, width, height, notes]);
 
   // Secret Dev Reset Key Listener (v + b + n)
@@ -983,27 +983,28 @@ export default function CanvasWall({
   const isTabletOrMobile = width < 1024;
 
   return (
-    <div className="relative w-full h-full bg-white overflow-hidden select-none">
+    <div className="relative w-full h-full overflow-hidden select-none">
+      <AmbientBackground />
+
       {/* Top Navbar HUD */}
       <div 
-        className="wall-ui-element absolute top-0 left-0 right-0 p-4 md:px-8 md:py-5 flex flex-col md:flex-row gap-4 items-center justify-between border-b border-neutral-200/20"
+        className="absolute top-0 left-0 right-0 p-4 md:px-8 md:py-5 flex flex-col md:flex-row gap-4 items-center justify-between bg-transparent pointer-events-none"
         style={{ 
           zIndex: 10,
-          backgroundColor: "rgba(255, 255, 255, 0.15)",
         }}
       >
         {/* Elegant Brand Title */}
-        <div className="flex flex-col items-center md:items-start text-center md:text-left">
-          <h1 className="text-2xl md:text-3xl font-light tracking-[0.45em] uppercase text-black mb-1 select-none font-sans">
+        <div className="flex flex-col items-center md:items-start text-center md:text-left pointer-events-auto">
+          <h1 className="text-2xl md:text-3xl font-light tracking-[0.45em] uppercase text-black mb-1 select-none font-sans [text-shadow:_0_1px_3px_rgba(255,255,255,0.8)]">
             LA PARED
           </h1>
-          <p className="text-[9px] md:text-[10px] text-neutral-400 uppercase tracking-[0.25em] font-sans">
+          <p className="text-[9px] md:text-[10px] text-neutral-400 uppercase tracking-[0.25em] font-sans [text-shadow:_0_1px_2px_rgba(255,255,255,0.8)]">
             El registro inmutable de la humanidad
           </p>
         </div>
 
         {/* Dynamic Navigation Coordinates HUD */}
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-4 pointer-events-auto">
           <div className="gallery-ui px-4 py-2.5 md:px-5 md:py-3 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] bg-white border border-black flex items-center gap-4 md:gap-5">
             <div className="flex flex-col items-center md:items-end">
               <span className="text-[8px] uppercase text-neutral-400 tracking-widest leading-none font-mono font-bold">
@@ -1059,7 +1060,7 @@ export default function CanvasWall({
             willChange: "transform",
           }}
         >
-          <canvas ref={canvasRef} className="absolute inset-0 block w-full h-full bg-white" />
+          <canvas ref={canvasRef} className="absolute inset-0 block w-full h-full bg-transparent" />
 
           {/* Floating Minimalist Sticky Notes */}
           {notes.map((note, index) => {
