@@ -75,7 +75,7 @@ export default function NoteDetailsModal({ note, onClose }: NoteDetailsModalProp
             <span className={`text-[10px] font-mono tracking-[0.2em] uppercase ${secondaryColorClass}`}>Inscripción Grabada</span>
             <h3 className={`text-sm font-bold font-mono mt-1 flex items-center gap-1.5 ${textColorClass}`}>
               <Compass className="w-4 h-4 shrink-0" />
-              X: {note.x.toLocaleString()} | Y: {note.y.toLocaleString()}
+              X: {note.x.toLocaleString()} | Y: {(-note.y).toLocaleString()}
             </h3>
           </div>
           <button
