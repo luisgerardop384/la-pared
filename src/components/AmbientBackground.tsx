@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useMemo } from 'react';
+import React, { useEffect, useState, useMemo, useRef } from 'react';
 import {
   getAmbientState,
   AmbientState,
@@ -9,8 +9,34 @@ import {
 } from '../Environment';
 
 export default function AmbientBackground() {
-  const [ambientState, setAmbientState] = useState<AmbientState>(() => getAmbientState());
+  const [currentAmbient, setCurrentAmbient] = useState<AmbientState>(() => getAmbientState());
+  const [nextAmbient, setNextAmbient] = useState<AmbientState | null>(null);
+  const [crossFadeActive, setCrossFadeActive] = useState(false);
   const [isTabActive, setIsTabActive] = useState(true);
+
+  const activeKeyRef = useRef<string>(`${currentAmbient.timeOfDay}-${currentAmbient.weather}`);
+
+  const checkAndUpdateAmbient = () => {
+    const freshState = getAmbientState();
+    const freshKey = `${freshState.timeOfDay}-${freshState.weather}`;
+
+    if (freshKey !== activeKeyRef.current) {
+      activeKeyRef.current = freshKey;
+      setNextAmbient(freshState);
+
+      // Iniciar la transición de desvanecimiento cruzado (cross-fade)
+      requestAnimationFrame(() => {
+        setCrossFadeActive(true);
+      });
+
+      // Transición completa de 2 segundos
+      setTimeout(() => {
+        setCurrentAmbient(freshState);
+        setNextAmbient(null);
+        setCrossFadeActive(false);
+      }, 2000);
+    }
+  };
 
   // Comprobar visibilidad de la pestaña para pausar cuando no esté activa
   useEffect(() => {
@@ -18,7 +44,7 @@ export default function AmbientBackground() {
       const active = !document.hidden;
       setIsTabActive(active);
       if (active) {
-        setAmbientState(getAmbientState());
+        checkAndUpdateAmbient();
       }
     };
 
@@ -28,11 +54,11 @@ export default function AmbientBackground() {
     };
   }, []);
 
-  // Actualizar el estado del ambiente cada minuto (60000ms)
+  // Actualizar el estado del ambiente periódicamente (comprobación cada minuto)
   useEffect(() => {
     const interval = setInterval(() => {
       if (!document.hidden) {
-        setAmbientState(getAmbientState());
+        checkAndUpdateAmbient();
       }
     }, CHECK_INTERVAL_MS);
 
@@ -81,17 +107,67 @@ export default function AmbientBackground() {
     return items;
   }, []);
 
-  const { backgroundStyle, showStars, showRain, weather } = ambientState;
+  const renderAmbientLayer = (state: AmbientState, opacityVal: number, transitionCss: boolean) => {
+    const { backgroundStyle, showStars, showRain, weather } = state;
+
+    return (
+      <div
+        className="absolute inset-0 w-full h-full pointer-events-none overflow-hidden"
+        style={{
+          ...backgroundStyle,
+          opacity: opacityVal,
+          transition: transitionCss ? 'opacity 2s ease-in-out' : 'none',
+        }}
+      >
+        {/* Capa de Estrellas (sólo de noche sin nubes) */}
+        {showStars && isTabActive && (
+          <div className="absolute inset-0 w-full h-full pointer-events-none">
+            {stars.map((star) => (
+              <div
+                key={star.id}
+                className="absolute rounded-full bg-white"
+                style={{
+                  left: `${star.left}%`,
+                  top: `${star.top}%`,
+                  width: `${star.size}px`,
+                  height: `${star.size}px`,
+                  opacity: star.opacity,
+                  boxShadow: '0 0 3px rgba(255, 255, 255, 0.8)',
+                  animation: `ambient-twinkle ${star.duration}s ease-in-out ${star.delay}s infinite`,
+                }}
+              />
+            ))}
+          </div>
+        )}
+
+        {/* Capa de Lluvia (lluvia / tormenta) */}
+        {showRain && isTabActive && (
+          <div className="absolute inset-0 w-full h-full pointer-events-none overflow-hidden">
+            {rainDrops.map((drop) => (
+              <div
+                key={drop.id}
+                className="absolute rounded-full"
+                style={{
+                  left: `${drop.left}%`,
+                  top: `-30px`,
+                  width: '1px',
+                  height: `${drop.height}px`,
+                  backgroundColor:
+                    weather === 'storm' ? RAIN_CONFIG.stormColor : RAIN_CONFIG.color,
+                  opacity: drop.opacity,
+                  transform: `rotate(${RAIN_CONFIG.angleDeg}deg)`,
+                  animation: `ambient-rain ${drop.duration}s linear ${drop.delay}s infinite`,
+                }}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
 
   return (
-    <div
-      className="fixed inset-0 w-full h-full pointer-events-none overflow-hidden"
-      style={{
-        zIndex: 0,
-        ...backgroundStyle,
-        transition: 'background 2s ease-in-out, background-color 2s ease-in-out',
-      }}
-    >
+    <div className="fixed inset-0 w-full h-full pointer-events-none overflow-hidden" style={{ zIndex: 0 }}>
       <style>{`
         @keyframes ambient-twinkle {
           0%, 100% {
@@ -122,49 +198,11 @@ export default function AmbientBackground() {
         }
       `}</style>
 
-      {/* Capa de Estrellas (sólo de noche sin nubes) */}
-      {showStars && isTabActive && (
-        <div className="absolute inset-0 w-full h-full pointer-events-none">
-          {stars.map((star) => (
-            <div
-              key={star.id}
-              className="absolute rounded-full bg-white"
-              style={{
-                left: `${star.left}%`,
-                top: `${star.top}%`,
-                width: `${star.size}px`,
-                height: `${star.size}px`,
-                opacity: star.opacity,
-                boxShadow: '0 0 3px rgba(255, 255, 255, 0.8)',
-                animation: `ambient-twinkle ${star.duration}s ease-in-out ${star.delay}s infinite`,
-              }}
-            />
-          ))}
-        </div>
-      )}
+      {/* Capa Base del Ambiente Actual */}
+      {renderAmbientLayer(currentAmbient, 1, false)}
 
-      {/* Capa de Lluvia (lluvia / tormenta) */}
-      {showRain && isTabActive && (
-        <div className="absolute inset-0 w-full h-full pointer-events-none overflow-hidden">
-          {rainDrops.map((drop) => (
-            <div
-              key={drop.id}
-              className="absolute rounded-full"
-              style={{
-                left: `${drop.left}%`,
-                top: `-30px`,
-                width: '1px',
-                height: `${drop.height}px`,
-                backgroundColor:
-                  weather === 'storm' ? RAIN_CONFIG.stormColor : RAIN_CONFIG.color,
-                opacity: drop.opacity,
-                transform: `rotate(${RAIN_CONFIG.angleDeg}deg)`,
-                animation: `ambient-rain ${drop.duration}s linear ${drop.delay}s infinite`,
-              }}
-            />
-          ))}
-        </div>
-      )}
+      {/* Capa de Transición para Transición Suave de Desvanecimiento Cruzado */}
+      {nextAmbient && renderAmbientLayer(nextAmbient, crossFadeActive ? 1 : 0, true)}
     </div>
   );
 }
