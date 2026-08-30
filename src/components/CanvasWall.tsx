@@ -1215,15 +1215,6 @@ export default function CanvasWall({
                 {Math.round(scale * 100)}%
               </span>
             </div>
-            <div className="w-px h-6 bg-neutral-200" />
-            <div className="flex flex-col items-center md:items-end">
-              <span className="text-[8px] uppercase text-neutral-400 tracking-widest leading-none font-mono font-bold">
-                Cargadas
-              </span>
-              <span className="text-xs font-mono font-bold text-black mt-1">
-                {notes.length} notas
-              </span>
-            </div>
           </div>
         </div>
       </div>
