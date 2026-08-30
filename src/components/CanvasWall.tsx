@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Compass, Plus, Sparkles, HelpCircle, X, Download } from "lucide-react";
+import { Compass, Plus, Sparkles, HelpCircle, X } from "lucide-react";
 import { Note } from "../types";
 import { supabase } from '../supabaseClient';
 import AmbientBackground from "./AmbientBackground";
@@ -32,6 +32,31 @@ const AVAILABLE_FONTS = [
   { name: "Llamativa", css: "'Impact', sans-serif" },
 ];
 
+async function extractEdgeFunctionError(invokeError: any): Promise<string> {
+  if (!invokeError) return "Error desconocido al contactar la función.";
+
+  if (invokeError.context && typeof invokeError.context.json === "function") {
+    try {
+      const errBody = await invokeError.context.json();
+      if (errBody && errBody.error) {
+        return errBody.error;
+      }
+    } catch (_) {}
+  }
+
+  if (
+    invokeError.message &&
+    invokeError.message !== "Edge Function returned a non-2xx status code"
+  ) {
+    return invokeError.message;
+  }
+
+  if (invokeError.name === "FunctionsFetchError" || !invokeError.context) {
+    return "No se pudo contactar con la Edge Function 'admin-note'. Verifica tu conexión a internet o el estado de Supabase.";
+  }
+
+  return `Error en la Edge Function (código ${invokeError.context?.status || "desconocido"}).`;
+}
 
 export default function CanvasWall({
   clientId,
@@ -47,12 +72,16 @@ export default function CanvasWall({
   const [offsetX, setOffsetX] = useState(0);
   const [offsetY, setOffsetY] = useState(0);
 
+  // Mouse pan state
   const [isDragging, setIsDragging] = useState(false);
+  const [isPointerDown, setIsPointerDown] = useState(false);
+  const [hasMouseDragged, setHasMouseDragged] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const [dragStartOffset, setDragStartOffset] = useState({ x: 0, y: 0 });
+  const [mouseDownNoteId, setMouseDownNoteId] = useState<string | null>(null);
 
-  const [width, setWidth] = useState(() => typeof window !== "undefined" ? window.innerWidth : 800);
-  const [height, setHeight] = useState(() => typeof window !== "undefined" ? window.innerHeight : 600);
+  const [width, setWidth] = useState(() => (typeof window !== "undefined" ? window.innerWidth : 800));
+  const [height, setHeight] = useState(() => (typeof window !== "undefined" ? window.innerHeight : 600));
 
   // Camera scale (Zoom limits: MIN_SCALE=0.35, MAX_SCALE=1.8, starts at 1.0 on desktop, 0.65 on mobile)
   const [scale, setScale] = useState(() => {
@@ -62,11 +91,34 @@ export default function CanvasWall({
   const MIN_SCALE = 0.35;
   const MAX_SCALE = 1.8;
 
-  // Camera translation variables (as defined mathematically to match view coordinates centered on offsetX/Y)
+  // Onboarding first visit state (stored in localStorage only)
+  const [isOnboardingActive, setIsOnboardingActive] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return localStorage.getItem("lapared_onboarding_seen") !== "true";
+  });
+
+  const dismissOnboarding = () => {
+    setIsOnboardingActive(false);
+    try {
+      localStorage.setItem("lapared_onboarding_seen", "true");
+    } catch (_) {}
+  };
+
+  // Auto-dismiss onboarding after 7.5 seconds
+  useEffect(() => {
+    if (isOnboardingActive) {
+      const timer = setTimeout(() => {
+        dismissOnboarding();
+      }, 7500);
+      return () => clearTimeout(timer);
+    }
+  }, [isOnboardingActive]);
+
+  // Camera translation variables
   const cameraX = -offsetX + width / (2 * scale);
   const cameraY = -offsetY + height / (2 * scale);
 
-  // Aplicar la escala y posición al contenedor de la pared
+  // Direct camera transform on DOM
   const aplicarTransformacionCamara = () => {
     const paredCanvas = document.getElementById("pared-canvas");
     if (paredCanvas) {
@@ -78,21 +130,18 @@ export default function CanvasWall({
     }
   };
 
-  // Run camera transformation whenever scale, cameraX, or cameraY change
   useEffect(() => {
     aplicarTransformacionCamara();
   }, [scale, cameraX, cameraY]);
 
-  // SISTEMA ANTICOLISIÓN - Desactivado para permitir ubicación libre exacta
   const calcularPosicionFinal = (
     clickX: number,
-    clickY: number,
-    notasExistentes: Note[]
+    clickY: number
   ): { x: number; y: number } => {
     return { x: Math.round(clickX), y: Math.round(clickY) };
   };
 
-  // Creation state with canvas relative coordinates to center precisely
+  // Creation state
   const [creatingNote, setCreatingNote] = useState<{
     x: number;
     y: number;
@@ -143,12 +192,12 @@ export default function CanvasWall({
     if (!container) return;
 
     const handleWheel = (e: WheelEvent) => {
+      cancelSurpriseTravel();
       e.preventDefault();
-      const zoomFactor = 0.08; // Smooth zoom adjustment speed
+      const zoomFactor = 0.08;
       setScale((prevScale) => {
         const delta = e.deltaY < 0 ? zoomFactor : -zoomFactor;
-        const newScale = Math.min(Math.max(prevScale + delta, MIN_SCALE), MAX_SCALE);
-        return newScale;
+        return Math.min(Math.max(prevScale + delta, MIN_SCALE), MAX_SCALE);
       });
     };
 
@@ -163,6 +212,7 @@ export default function CanvasWall({
   const cachedZonesRef = useRef<Set<string>>(new Set());
   const pendingZonesRef = useRef<Set<string>>(new Set());
   const notesMapRef = useRef<Map<string, Note>>(new Map());
+  const appearedNoteIdsRef = useRef<Set<string>>(new Set());
 
   // Fetch Notes in Viewport
   const fetchNotesInViewport = async (
@@ -173,10 +223,8 @@ export default function CanvasWall({
     curScale: number,
     forceInvalidateBounds = false
   ) => {
-    // If zoomed out (low scale), the world area seen is much larger
     const worldW = viewW / curScale;
     const worldH = viewH / curScale;
-    // Extra padding around viewport to load notes on edges smoothly
     const padX = Math.round(worldW * 1.5);
     const padY = Math.round(worldH * 1.5);
     const minX = Math.round(curX - padX);
@@ -207,16 +255,16 @@ export default function CanvasWall({
       }
     }
 
-    // If all zones in the current viewport are already cached, avoid duplicate network calls
     if (uncachedZones.length === 0) {
       return;
     }
 
-    // Mark missing zones as pending to avoid duplicate concurrent requests
     uncachedZones.forEach((key) => pendingZonesRef.current.add(key));
 
-    // Calculate bounding box covering the uncached zones
-    let qMinX = Infinity, qMaxX = -Infinity, qMinY = Infinity, qMaxY = -Infinity;
+    let qMinX = Infinity,
+      qMaxX = -Infinity,
+      qMinY = Infinity,
+      qMaxY = -Infinity;
     uncachedZones.forEach((key) => {
       const [zxStr, zyStr] = key.split(",");
       const zx = Number(zxStr);
@@ -289,14 +337,12 @@ export default function CanvasWall({
     };
   }, [offsetX, offsetY, width, height, scale]);
 
-  // Main Canvas Render Loop - Estética Pureza Blanca (Sin Cuadrícula)
+  // Main Canvas Render Loop
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-
-    // Limpiar canvas para que el fondo de ambiente sea visible
     ctx.clearRect(0, 0, width, height);
   }, [offsetX, offsetY, width, height, notes]);
 
@@ -315,7 +361,7 @@ export default function CanvasWall({
 
       if (keysPressed.has("v") && keysPressed.has("b") && keysPressed.has("n")) {
         keysPressed.clear();
-        
+
         const password = window.prompt("Introduce la contraseña de administrador para borrar todas las notas:");
         if (!password) {
           return;
@@ -325,12 +371,13 @@ export default function CanvasWall({
 
         try {
           const { data, error } = await supabase.functions.invoke("admin-note", {
-            body: { action: "clear", password }
+            body: { action: "clear", password },
           });
 
           if (error) {
             console.error("Error al invocar admin-note para borrar:", error);
-            alert("No se pudo contactar con la función de administración o la contraseña es incorrecta.");
+            const errorMsg = await extractEdgeFunctionError(error);
+            alert(`Error: ${errorMsg}`);
             return;
           }
 
@@ -344,12 +391,13 @@ export default function CanvasWall({
           cachedZonesRef.current.clear();
           pendingZonesRef.current.clear();
           notesMapRef.current.clear();
+          appearedNoteIdsRef.current.clear();
           console.log("La Pared ha sido reiniciada con éxito.");
           setNotes([]);
           alert("La Pared ha sido reiniciada con éxito.");
-        } catch (err) {
-          console.error("Error de red al intentar reiniciar La Pared:", err);
-          alert("Error de red al intentar reiniciar La Pared.");
+        } catch (err: any) {
+          console.error("Error al intentar reiniciar La Pared:", err);
+          alert(err.message || "Error al intentar reiniciar La Pared.");
         }
       }
     };
@@ -367,33 +415,182 @@ export default function CanvasWall({
     };
   }, []);
 
-  // DRAG & PAN EVENTS
+  // Surprise Me Animation & State
+  const [isTraveling, setIsTraveling] = useState(false);
+  const isTravelingRef = useRef(false);
+  const surpriseAnimationRef = useRef<number | null>(null);
+  const surpriseOpenTimerRef = useRef<number | null>(null);
+  const lastSurpriseNoteIdRef = useRef<string | null>(null);
+
+  // Cancellation helper to cleanly stop any active travel
+  const cancelSurpriseTravel = () => {
+    if (surpriseAnimationRef.current) {
+      cancelAnimationFrame(surpriseAnimationRef.current);
+      surpriseAnimationRef.current = null;
+    }
+    if (surpriseOpenTimerRef.current) {
+      clearTimeout(surpriseOpenTimerRef.current);
+      surpriseOpenTimerRef.current = null;
+    }
+    if (isTravelingRef.current) {
+      isTravelingRef.current = false;
+      setIsTraveling(false);
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      cancelSurpriseTravel();
+    };
+  }, []);
+
+  const handleSurpriseMe = () => {
+    dismissOnboarding();
+    cancelSurpriseTravel();
+
+    if (!notes || notes.length === 0) {
+      return;
+    }
+
+    // Filtrar para evitar repetir la misma nota dos veces seguidas si hay más de una
+    let candidates = notes;
+    if (notes.length > 1 && lastSurpriseNoteIdRef.current) {
+      candidates = notes.filter((n) => n._id !== lastSurpriseNoteIdRef.current);
+      if (candidates.length === 0) candidates = notes;
+    }
+
+    const randomIndex = Math.floor(Math.random() * candidates.length);
+    const targetNote = candidates[randomIndex];
+    lastSurpriseNoteIdRef.current = targetNote._id;
+
+    const startX = offsetXRef.current;
+    const startY = offsetYRef.current;
+    const targetX = targetNote.x;
+    const targetY = targetNote.y;
+
+    const startTime = performance.now();
+    const duration = 750; // ms animación fluida y suave
+
+    isTravelingRef.current = true;
+    setIsTraveling(true);
+
+    const animate = (now: number) => {
+      if (!isTravelingRef.current) return;
+
+      const elapsed = now - startTime;
+      const progress = Math.min(1, elapsed / duration);
+
+      // Curva de aceleración/desaceleración suave (ease-out cubic)
+      const ease = 1 - Math.pow(1 - progress, 3);
+
+      const currentX = Math.round(startX + (targetX - startX) * ease);
+      const currentY = Math.round(startY + (targetY - startY) * ease);
+
+      offsetXRef.current = currentX;
+      offsetYRef.current = currentY;
+
+      const paredCanvas = document.getElementById("pared-canvas");
+      if (paredCanvas) {
+        const s = scaleRef.current;
+        const w = widthRef.current;
+        const h = heightRef.current;
+        const camX = -currentX + w / (2 * s);
+        const camY = -currentY + h / (2 * s);
+        paredCanvas.style.transform = `scale(${s}) translate3d(${Math.round(camX)}px, ${Math.round(camY)}px, 0px)`;
+      }
+
+      if (progress < 1) {
+        surpriseAnimationRef.current = requestAnimationFrame(animate);
+      } else {
+        surpriseAnimationRef.current = null;
+        isTravelingRef.current = false;
+        setIsTraveling(false);
+        setOffsetX(targetX);
+        setOffsetY(targetY);
+        setHoveredNoteId(targetNote._id);
+
+        // Abrir automáticamente la nota en grande con el mismo visor/modal estándar
+        setSelectedNote(targetNote);
+        dismissOnboarding();
+
+        surpriseOpenTimerRef.current = window.setTimeout(() => {
+          setHoveredNoteId(null);
+          surpriseOpenTimerRef.current = null;
+        }, 1500);
+      }
+    };
+
+    surpriseAnimationRef.current = requestAnimationFrame(animate);
+  };
+
+  // MOUSE DRAG & PAN (Permite iniciar arrastre sobre notas o fondo)
   const handleMouseDown = (e: React.MouseEvent) => {
     if (e.button !== 0) return; // Left click only
     const target = e.target as HTMLElement;
-    if (target.closest(".interactive-note") || target.closest(".wall-ui-element")) return;
 
-    setIsDragging(true);
+    // Ignorar sólo si está dentro del formulario de creación o botones/elementos UI
+    if (
+      target.closest("#cuadro-nueva-inscripcion") ||
+      target.closest(".wall-ui-element") ||
+      target.closest("button") ||
+      target.closest("textarea") ||
+      target.closest("input")
+    ) {
+      return;
+    }
+
+    cancelSurpriseTravel();
+
+    const noteEl = target.closest(".interactive-note") as HTMLElement | null;
+    const noteId = noteEl?.dataset?.noteId || null;
+
+    setIsPointerDown(true);
+    setHasMouseDragged(false);
+    setMouseDownNoteId(noteId);
     setDragStart({ x: e.clientX, y: e.clientY });
     setDragStartOffset({ x: offsetX, y: offsetY });
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
-    if (!isDragging) return;
+    if (!isPointerDown) return;
     const dx = e.clientX - dragStart.x;
     const dy = e.clientY - dragStart.y;
-    setOffsetX(Math.round(dragStartOffset.x - dx / scale));
-    setOffsetY(Math.round(dragStartOffset.y - dy / scale));
+    const dist = Math.hypot(dx, dy);
+
+    if (!hasMouseDragged && dist > 6) {
+      setHasMouseDragged(true);
+      setIsDragging(true);
+      dismissOnboarding();
+    }
+
+    if (hasMouseDragged || dist > 6) {
+      setOffsetX(Math.round(dragStartOffset.x - dx / scale));
+      setOffsetY(Math.round(dragStartOffset.y - dy / scale));
+    }
   };
 
-  const handleMouseUp = () => {
+  const handleMouseUp = (e: React.MouseEvent) => {
+    if (isPointerDown) {
+      if (!hasMouseDragged && mouseDownNoteId) {
+        const found = notes.find((n) => n._id === mouseDownNoteId);
+        if (found) {
+          setSelectedNote(found);
+          dismissOnboarding();
+        }
+      }
+    }
+    setIsPointerDown(false);
     setIsDragging(false);
+    setHasMouseDragged(false);
+    setMouseDownNoteId(null);
   };
 
   // Touch tracking refs for ultra-smooth 60/120fps direct DOM manipulation
   const touchStartRef = useRef({ x: 0, y: 0 });
   const touchStartOffsetRef = useRef({ x: 0, y: 0 });
   const isTouchDraggingRef = useRef(false);
+  const hasTouchMovedBeyondThresholdRef = useRef(false);
+  const touchNoteTargetIdRef = useRef<string | null>(null);
 
   // Pinch-to-zoom tracking refs
   const isPinchingRef = useRef(false);
@@ -404,7 +601,7 @@ export default function CanvasWall({
   const lastTouchTimeRef = useRef<number>(0);
   const lastTouchPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
 
-  // Sync state values with refs to prevent stale state closures in native listeners
+  // Sync state values with refs
   const offsetXRef = useRef(offsetX);
   const offsetYRef = useRef(offsetY);
   const scaleRef = useRef(scale);
@@ -430,13 +627,14 @@ export default function CanvasWall({
 
   // Generic helper to trigger note creation at a screen coordinate (clientX, clientY)
   const triggerCreateNote = (clientX: number, clientY: number) => {
+    cancelSurpriseTravel();
+    dismissOnboarding();
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
 
     const relativeX = clientX - rect.left;
     const relativeY = clientY - rect.top;
 
-    // Direct, exact Screen-to-World mapping formula using current refs to avoid state lag
     const currentScale = scaleRef.current;
     const currentOffsetX = offsetXRef.current;
     const currentOffsetY = offsetYRef.current;
@@ -444,7 +642,7 @@ export default function CanvasWall({
     const actualX = (relativeX - rect.width / 2) / currentScale + currentOffsetX;
     const actualY = (relativeY - rect.height / 2) / currentScale + currentOffsetY;
 
-    const posicionFinal = calcularPosicionFinal(actualX, actualY, notes);
+    const posicionFinal = calcularPosicionFinal(actualX, actualY);
 
     setCreatingNote({
       x: posicionFinal.x,
@@ -458,7 +656,7 @@ export default function CanvasWall({
     setSavingError("");
   };
 
-  // Native touch listener to prevent default browser overscroll refresh, elastic bounce, page zoom, and enable pinch-to-zoom
+  // Native touch listener to prevent default browser overscroll, and enable pan across notes & empty canvas
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -471,8 +669,7 @@ export default function CanvasWall({
       pendingUpdate = true;
       animationFrameId = requestAnimationFrame(() => {
         pendingUpdate = false;
-        
-        // Direct, high-speed DOM transform for perfect fluid movement
+
         const paredCanvas = document.getElementById("pared-canvas");
         if (paredCanvas) {
           const s = scaleRef.current;
@@ -482,7 +679,7 @@ export default function CanvasWall({
           const h = heightRef.current;
           const camX = -oX + w / (2 * s);
           const camY = -oY + h / (2 * s);
-          
+
           paredCanvas.style.transform = `scale(${s}) translate3d(${Math.round(camX)}px, ${Math.round(camY)}px, 0px)`;
         }
       });
@@ -490,38 +687,41 @@ export default function CanvasWall({
 
     const handleTouchStartNative = (e: TouchEvent) => {
       const target = e.target as HTMLElement;
-      // If the user touches any interactive node, manual, form input, or buttons, allow standard interaction
+
+      // Allow normal typing and button interaction inside creating note modal and UI overlays
       if (
-        target.closest(".interactive-note") || 
+        target.closest("#cuadro-nueva-inscripcion") ||
         target.closest(".wall-ui-element") ||
         target.closest("button") ||
         target.closest("textarea") ||
         target.closest("input")
       ) {
-        return; 
+        return;
       }
 
-      // Prevent page-level gestures (pull-to-refresh, safari page zoom) on the background canvas
       e.preventDefault();
+      cancelSurpriseTravel();
 
       if (e.touches.length === 1) {
         const touch = e.touches[0];
         const touchX = touch.clientX;
         const touchY = touch.clientY;
 
+        const noteEl = target.closest(".interactive-note") as HTMLElement | null;
+        touchNoteTargetIdRef.current = noteEl?.dataset?.noteId || null;
+        hasTouchMovedBeyondThresholdRef.current = false;
+
         const now = Date.now();
         const lastTouchTime = lastTouchTimeRef.current;
         const lastTouchPos = lastTouchPosRef.current;
         const delay = now - lastTouchTime;
-        const dist = Math.sqrt((touchX - lastTouchPos.x) ** 2 + (touchY - lastTouchPos.y) ** 2);
+        const dist = Math.hypot(touchX - lastTouchPos.x, touchY - lastTouchPos.y);
 
-        if (delay < 300 && dist < 30) {
-          // Double-tap detected!
-          // Reset tracker to prevent cascading/triple taps
+        // Double-tap on empty canvas
+        if (!touchNoteTargetIdRef.current && delay < 300 && dist < 30) {
           lastTouchTimeRef.current = 0;
           isTouchDraggingRef.current = false;
           isPinchingRef.current = false;
-          
           triggerCreateNote(touchX, touchY);
           return;
         }
@@ -529,7 +729,7 @@ export default function CanvasWall({
         lastTouchTimeRef.current = now;
         lastTouchPosRef.current = { x: touchX, y: touchY };
 
-        // Dragging/Panning mode
+        // Initiate dragging / panning
         isTouchDraggingRef.current = true;
         isPinchingRef.current = false;
         touchStartRef.current = { x: touchX, y: touchY };
@@ -538,12 +738,12 @@ export default function CanvasWall({
         // Pinch-to-zoom mode
         isTouchDraggingRef.current = false;
         isPinchingRef.current = true;
-        
+
         const touch1 = e.touches[0];
         const touch2 = e.touches[1];
         const dx = touch1.clientX - touch2.clientX;
         const dy = touch1.clientY - touch2.clientY;
-        initialPinchDistanceRef.current = Math.sqrt(dx * dx + dy * dy);
+        initialPinchDistanceRef.current = Math.hypot(dx, dy);
         initialPinchScaleRef.current = scaleRef.current;
       }
     };
@@ -551,13 +751,13 @@ export default function CanvasWall({
     const handleTouchMoveNative = (e: TouchEvent) => {
       const target = e.target as HTMLElement;
       if (
-        target.closest(".interactive-note") || 
+        target.closest("#cuadro-nueva-inscripcion") ||
         target.closest(".wall-ui-element") ||
         target.closest("button") ||
         target.closest("textarea") ||
         target.closest("input")
       ) {
-        return; 
+        return;
       }
 
       e.preventDefault();
@@ -566,40 +766,56 @@ export default function CanvasWall({
         const touch = e.touches[0];
         const dx = touch.clientX - touchStartRef.current.x;
         const dy = touch.clientY - touchStartRef.current.y;
-        
+        const dist = Math.hypot(dx, dy);
+
+        if (dist > 7) {
+          hasTouchMovedBeyondThresholdRef.current = true;
+          dismissOnboarding();
+        }
+
         const s = scaleRef.current;
         offsetXRef.current = Math.round(touchStartOffsetRef.current.x - dx / s);
         offsetYRef.current = Math.round(touchStartOffsetRef.current.y - dy / s);
-        
+
         requestUpdate();
       } else if (e.touches.length === 2 && isPinchingRef.current) {
         const touch1 = e.touches[0];
         const touch2 = e.touches[1];
         const dx = touch1.clientX - touch2.clientX;
         const dy = touch1.clientY - touch2.clientY;
-        const currentDistance = Math.sqrt(dx * dx + dy * dy);
-        
+        const currentDistance = Math.hypot(dx, dy);
+
         if (initialPinchDistanceRef.current > 10) {
           const factor = currentDistance / initialPinchDistanceRef.current;
-          // Apply strict zoom limits to prevent camera clipping
           const newScale = Math.min(Math.max(initialPinchScaleRef.current * factor, MIN_SCALE), MAX_SCALE);
           scaleRef.current = newScale;
-          
+
           requestUpdate();
         }
       }
     };
 
     const handleTouchEndNative = (e: TouchEvent) => {
-      // Commit final drag/pinch position/scale to React state once gesture concludes
       if (isTouchDraggingRef.current || isPinchingRef.current) {
         setOffsetX(offsetXRef.current);
         setOffsetY(offsetYRef.current);
         setScale(scaleRef.current);
       }
-      
+
+      // If user tapped a note without dragging beyond threshold, open note modal!
+      if (!hasTouchMovedBeyondThresholdRef.current && touchNoteTargetIdRef.current) {
+        const noteId = touchNoteTargetIdRef.current;
+        const found = notesMapRef.current.get(noteId);
+        if (found) {
+          setSelectedNote(found);
+          dismissOnboarding();
+        }
+      }
+
       isTouchDraggingRef.current = false;
       isPinchingRef.current = false;
+      hasTouchMovedBeyondThresholdRef.current = false;
+      touchNoteTargetIdRef.current = null;
     };
 
     container.addEventListener("touchstart", handleTouchStartNative, { passive: false });
@@ -616,34 +832,40 @@ export default function CanvasWall({
     };
   }, []);
 
-  // DOUBLE CLICK - Create a Note
+  // DOUBLE CLICK - Create a Note (Desktop)
   const handleDoubleClick = (e: React.MouseEvent) => {
     const target = e.target as HTMLElement;
-    if (target.closest(".interactive-note") || target.closest(".wall-ui-element")) return;
+    if (
+      target.closest(".interactive-note") ||
+      target.closest(".wall-ui-element") ||
+      target.closest("button") ||
+      target.closest("input") ||
+      target.closest("textarea")
+    ) {
+      return;
+    }
     triggerCreateNote(e.clientX, e.clientY);
   };
 
-  // SAVE NOTE TO WALL (Engrave)
+  // SAVE NOTE TO WALL (80 characters limit)
   const handleSaveNote = async () => {
     if (!creatingNote || !creatingNote.text.trim()) return;
 
     const textTrimmed = creatingNote.text.trim();
 
-    // Strict character limit check (expanded on the frontend to allow password prefix)
-    if (textTrimmed.length > 100) {
-      setSavingError("La inscripción no puede exceder los 50 caracteres.");
+    // Strict character limit check of 80 characters
+    if (textTrimmed.length > 80 && !textTrimmed.includes(" ")) {
+      setSavingError("La inscripción no puede exceder los 80 caracteres.");
       return;
     }
 
     setSaving(true);
     setSavingError("");
 
-    // Guardar exactamente en las coordenadas donde el usuario hizo doble clic
     const finalX = Math.round(creatingNote.x);
     const finalY = Math.round(creatingNote.y);
 
     try {
-      // Invocar la Edge Function admin-note
       const { data: invokeData, error: invokeError } = await supabase.functions.invoke("admin-note", {
         body: {
           texto: textTrimmed,
@@ -651,13 +873,14 @@ export default function CanvasWall({
           y: finalY,
           color: creatingNote.color,
           fuente: creatingNote.fontFamily || 'Georgia',
-          client_id: clientId
-        }
+          client_id: clientId,
+        },
       });
 
       if (invokeError) {
-        console.warn("La Edge Function 'admin-note' falló o no está desplegada:", invokeError);
-        throw new Error("No se pudo contactar con la función administrativa 'admin-note'. Asegúrate de que esté desplegada y de configurar ADMIN_PASSWORD en Supabase.");
+        console.warn("Error al invocar la Edge Function 'admin-note':", invokeError);
+        const errorMsg = await extractEdgeFunctionError(invokeError);
+        throw new Error(errorMsg);
       }
 
       if (invokeData && invokeData.error) {
@@ -665,20 +888,23 @@ export default function CanvasWall({
       }
 
       if (invokeData && invokeData.isAdmin) {
-        // Invalidate the zone containing the admin note so fresh data is fetched for that zone
         const zx = Math.floor(finalX / ZONE_SIZE);
         const zy = Math.floor(finalY / ZONE_SIZE);
         cachedZonesRef.current.delete(`${zx},${zy}`);
 
-        // Si responde: { isAdmin: true } el frontend únicamente debe refrescar la pared.
         await fetchNotesInViewport(offsetX, offsetY, width, height, scale);
         setCreatingNote(null);
       } else if (invokeData && invokeData.isNormal) {
-        // Tratar como nota normal con la lógica de inserción normal del frontend
         const hasPosted = localStorage.getItem("lapared_has_posted") === "true";
         if (hasPosted) {
           setShowLimitAlert(true);
           setCreatingNote(null);
+          return;
+        }
+
+        if (textTrimmed.length > 80) {
+          setSavingError("La inscripción no puede exceder los 80 caracteres.");
+          setSaving(false);
           return;
         }
 
@@ -692,7 +918,7 @@ export default function CanvasWall({
               client_id: clientId,
               color: creatingNote.color,
               fuente: creatingNote.fontFamily || 'Georgia',
-            }
+            },
           ])
           .select();
 
@@ -721,22 +947,15 @@ export default function CanvasWall({
           createdAt: savedNote.created_at || new Date().toISOString(),
         };
 
-        // Mark as posted in localStorage
         localStorage.setItem("lapared_has_posted", "true");
 
-        // Add to memory map and cached zone
         notesMapRef.current.set(finalNote._id, finalNote);
         const zx = Math.floor(finalNote.x / ZONE_SIZE);
         const zy = Math.floor(finalNote.y / ZONE_SIZE);
         cachedZonesRef.current.add(`${zx},${zy}`);
 
-        // Add to local state immediately
         setNotes(Array.from(notesMapRef.current.values()));
-
-        // Automatically generate PNG photo with exact coordinates and download
         generateAndDownloadPhoto(finalNote);
-
-        // Reset state
         setCreatingNote(null);
       } else {
         throw new Error("Respuesta inválida o desconocida de la Edge Function.");
@@ -748,8 +967,7 @@ export default function CanvasWall({
     }
   };
 
-  // GENERATE PHOTO PNG & DOWNLOAD WITH WIDE CONTEXT
-  // GENERATE PHOTO PNG & DOWNLOAD WITH WIDE CONTEXT
+  // GENERATE PHOTO PNG & DOWNLOAD
   const generateAndDownloadPhoto = (newNote: Note) => {
     const exportCanvas = document.createElement("canvas");
     exportCanvas.width = 800;
@@ -757,31 +975,20 @@ export default function CanvasWall({
     const ctx = exportCanvas.getContext("2d");
     if (!ctx) return;
 
-    // 1. Clear with clean white background
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, 800, 600);
 
-    const scaleFactor = 0.75; // "Zoom out" camera ratio with generous surrounding space
+    const scaleFactor = 0.75;
 
-    // 2. Render all neighboring notes that are close to the center (newNote)
-    // Draw other notes first as background neighbors
     notes.forEach((note) => {
-      if (note._id === newNote._id) return; // Draw newNote last to be on top
-
-      // Calculate relative screen coordinate on the 800x600 canvas
-      // centered around newNote (which will be at 400, 300) and zoomed out by scaleFactor
+      if (note._id === newNote._id) return;
       const relX = (note.x - newNote.x) * scaleFactor + 400;
       const relY = (note.y - newNote.y) * scaleFactor + 300;
-
-      // Draw neighboring note
       drawNoteOnExportCanvas(ctx, note, relX, relY, scaleFactor, false);
     });
 
-    // 3. Draw the newly created note right in the center (400, 300)
     drawNoteOnExportCanvas(ctx, newNote, 400, 300, scaleFactor, true);
 
-    // 4. Draw HUD Watermark on the exported photo
-    // Minimalist layout stamp
     ctx.save();
     ctx.fillStyle = "#000000";
     ctx.font = "bold 18px monospace";
@@ -792,7 +999,6 @@ export default function CanvasWall({
     ctx.fillStyle = "#737373";
     ctx.fillText("El Registro Inmutable de la Humanidad", 45, 545);
 
-    // Stamp coordinates in the bottom right corner
     ctx.textAlign = "right";
     ctx.font = "bold 14px monospace";
     ctx.fillStyle = "#000000";
@@ -803,7 +1009,6 @@ export default function CanvasWall({
     ctx.fillText(`Grabado: ${new Date().toLocaleDateString()}`, 755, 545);
     ctx.restore();
 
-    // 5. Download Trigger
     const dataURL = exportCanvas.toDataURL("image/png");
     const link = document.createElement("a");
     link.download = `lapared_inscripcion_${newNote.x}_${-newNote.y}.png`;
@@ -811,7 +1016,6 @@ export default function CanvasWall({
     link.click();
   };
 
-  // Helper to draw a single note card on the export canvas
   const drawNoteOnExportCanvas = (
     ctx: CanvasRenderingContext2D,
     n: Note,
@@ -820,15 +1024,11 @@ export default function CanvasWall({
     scaleFactor: number,
     isNewNote: boolean
   ) => {
-    // Proportions matching the interactive card precisely:
-    // On desktop screen: width is 250px
     const w = 250;
-    
-    // First, calculate wrapping to determine dynamic height
     ctx.save();
     ctx.font = `13px ${n.fontFamily || "Georgia, serif"}`;
     const paddingLeftRight = 18;
-    const maxWidth = w - paddingLeftRight * 2; // 214px
+    const maxWidth = w - paddingLeftRight * 2;
 
     const paragraphs = n.text.split("\n");
     const lines: string[] = [];
@@ -877,44 +1077,36 @@ export default function CanvasWall({
       lines.push("");
     }
 
-    // Dynamic height based on wrapped lines
     const startYOffset = 25;
     const lineHeight = 17;
     const barHeight = 35;
     const extraPadding = 15;
     let h = startYOffset + lines.length * lineHeight + barHeight + extraPadding;
-    if (h < 135) h = 135; // minimum height to ensure good spacing
+    if (h < 135) h = 135;
 
-    ctx.restore(); // Restore context to clean state
+    ctx.restore();
 
-    // Skip if totally out of export viewport bounds (accounting for scaling and size)
     const margin = (w / 2) * scaleFactor;
-    if (relX < -margin || relX > 800 + margin || relY < -(h/2)*scaleFactor || relY > 600 + (h/2)*scaleFactor) {
+    if (relX < -margin || relX > 800 + margin || relY < -(h / 2) * scaleFactor || relY > 600 + (h / 2) * scaleFactor) {
       return;
     }
 
     ctx.save();
-    // Translate and scale the context for perfect vector proportions!
     ctx.translate(relX, relY);
     ctx.scale(scaleFactor, scaleFactor);
 
-    // Centered at (0, 0), so x and y are relative
     const x = -w / 2;
     const y = -h / 2;
 
-    // Minimalist solid shadow offset (scaled automatically)
     ctx.fillStyle = isNewNote ? "rgba(0, 0, 0, 0.08)" : "rgba(0, 0, 0, 0.03)";
     ctx.fillRect(x + (isNewNote ? 5 : 3), y + (isNewNote ? 5 : 3), w, h);
 
-    // Draw note body
     ctx.fillStyle = n.color || "#ffffff";
     ctx.fillRect(x, y, w, h);
 
-    // Draw bottom white bar (barra técnica inferior)
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(x + 0.5, y + h - barHeight, w - 1, barHeight - 0.5);
 
-    // Draw divider line between the note body and the white bottom bar
     ctx.strokeStyle = "#000000";
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -922,19 +1114,16 @@ export default function CanvasWall({
     ctx.lineTo(x + w, y + h - barHeight);
     ctx.stroke();
 
-    // Draw note border
     ctx.strokeStyle = "#000000";
     ctx.lineWidth = isNewNote ? 2 : 1;
     ctx.strokeRect(x, y, w, h);
 
-    // Double border inside to highlight newly created note
     if (isNewNote) {
       ctx.strokeStyle = "#000000";
       ctx.lineWidth = 1;
       ctx.strokeRect(x + 4, y + 4, w - 8, h - 8);
     }
 
-    // Determine contrast text color for the note body text
     const color = (n.color || "#ffffff").replace("#", "");
     const r = parseInt(color.substring(0, 2), 16);
     const g = parseInt(color.substring(2, 4), 16);
@@ -942,34 +1131,28 @@ export default function CanvasWall({
     const yiq = (r * 299 + g * 587 + b * 114) / 1000;
     ctx.fillStyle = yiq >= 128 ? "#000000" : "#ffffff";
 
-    // Typography setting
     ctx.font = `13px ${n.fontFamily || "Georgia, serif"}`;
     ctx.textBaseline = "top";
     ctx.textAlign = "left";
 
-    // Draw wrapped text
     const textStartY = y + startYOffset;
     for (let i = 0; i < lines.length; i++) {
       ctx.fillText(lines[i], x + paddingLeftRight, textStartY + i * lineHeight);
     }
 
-    // Draw content inside the technical white bottom bar
     ctx.fillStyle = "#000000";
     ctx.font = "8px monospace";
     ctx.textBaseline = "middle";
 
-    // Left side: Brand slogan
     ctx.textAlign = "left";
     ctx.fillText("El Registro Inmutable de la Humanidad", x + paddingLeftRight, y + h - barHeight / 2);
 
-    // Right side: Exact coordinates
     ctx.textAlign = "right";
     ctx.fillText(`X: ${n.x} | Y: ${-n.y}`, x + w - paddingLeftRight, y + h - barHeight / 2);
 
     ctx.restore();
   };
 
-  // Helper to determine text contrast based on background color
   const getTextColor = (hex: string) => {
     const color = hex.replace("#", "");
     const r = parseInt(color.substring(0, 2), 16);
@@ -987,11 +1170,9 @@ export default function CanvasWall({
       <AmbientBackground />
 
       {/* Top Navbar HUD */}
-      <div 
-        className="absolute top-0 left-0 right-0 p-4 md:px-8 md:py-5 flex flex-col md:flex-row gap-4 items-center justify-between bg-transparent pointer-events-none"
-        style={{ 
-          zIndex: 10,
-        }}
+      <div
+        className="absolute top-0 left-0 right-0 p-4 md:px-8 md:py-5 flex flex-col md:flex-row gap-3 md:gap-4 items-center justify-between bg-transparent pointer-events-none"
+        style={{ zIndex: 10 }}
       >
         {/* Elegant Brand Title */}
         <div className="flex flex-col items-center md:items-start text-center md:text-left pointer-events-auto">
@@ -1003,9 +1184,20 @@ export default function CanvasWall({
           </p>
         </div>
 
-        {/* Dynamic Navigation Coordinates HUD */}
-        <div className="flex items-center gap-4 pointer-events-auto">
-          <div className="gallery-ui px-4 py-2.5 md:px-5 md:py-3 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] bg-white border border-black flex items-center gap-4 md:gap-5">
+        {/* Dynamic Navigation Coordinates HUD & Sorpréndeme */}
+        <div className="flex items-center gap-3 md:gap-4 pointer-events-auto flex-wrap justify-center">
+          {/* 🎲 Sorpréndeme Button (Desktop Only) */}
+          <button
+            id="btn-sorprendeme"
+            onClick={handleSurpriseMe}
+            className="hidden md:flex gallery-ui px-3.5 py-2 md:px-4 md:py-2.5 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] bg-white border border-black hover:bg-neutral-50 active:translate-y-0.5 text-xs font-mono font-bold text-black items-center gap-2 cursor-pointer transition-all hover:shadow-[6px_6px_0px_0px_rgba(0,0,0,1)]"
+            title="Viajar hacia una nota existente de manera inesperada"
+          >
+            <span className="text-sm">🎲</span>
+            <span className="tracking-wider uppercase text-xs">Sorpréndeme</span>
+          </button>
+
+          <div className="gallery-ui px-3.5 py-1.5 md:px-5 md:py-2.5 shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] md:shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] bg-white border border-black flex items-center gap-3 md:gap-5">
             <div className="flex flex-col items-center md:items-end">
               <span className="text-[8px] uppercase text-neutral-400 tracking-widest leading-none font-mono font-bold">
                 Coordenadas
@@ -1036,6 +1228,36 @@ export default function CanvasWall({
         </div>
       </div>
 
+      {/* First Visit Discovery Banner / Tooltip */}
+      {isOnboardingActive && (
+        <div
+          className="wall-ui-element absolute top-28 md:top-24 left-1/2 -translate-x-1/2 z-30 pointer-events-auto animate-in fade-in slide-in-from-top-4 duration-300 px-4 w-full max-w-md text-center"
+        >
+          <div className="bg-white border-2 border-black shadow-[6px_6px_0px_0px_rgba(0,0,0,1)] p-3 md:p-3.5 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 text-left">
+              <span className="text-base md:text-lg">✨</span>
+              <div>
+                <p className="text-[11px] md:text-xs font-bold text-black font-sans leading-tight">
+                  {isMobile
+                    ? "Toca dos veces cualquier lugar para dejar tu nota"
+                    : "Haz doble clic en cualquier lugar para dejar tu nota"}
+                </p>
+                <p className="text-[9px] text-neutral-500 font-mono mt-0.5">
+                  Arrastra para navegar • Consulta el Manual (?) para más ayuda
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={dismissOnboarding}
+              className="text-neutral-400 hover:text-black p-1 transition-colors"
+              title="Cerrar ayuda"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Main Drag-to-Pan Canvas Area */}
       <div
         ref={containerRef}
@@ -1058,13 +1280,17 @@ export default function CanvasWall({
             transformStyle: "preserve-3d",
             backfaceVisibility: "hidden",
             willChange: "transform",
+            filter: isTraveling ? "blur(1.5px)" : "none",
+            opacity: isTraveling ? 0.88 : 1,
+            transition: isTraveling
+              ? "filter 0.25s ease-out, opacity 0.25s ease-out"
+              : "filter 0.3s ease-out, opacity 0.3s ease-out",
           }}
         >
           <canvas ref={canvasRef} className="absolute inset-0 block w-full h-full bg-transparent" />
 
           {/* Floating Minimalist Sticky Notes */}
           {notes.map((note, index) => {
-            // Real visible coordinates on the screen after scale:
             const visualX = (note.x - offsetX) * scale + width / 2;
             const visualY = (note.y - offsetY) * scale + height / 2;
 
@@ -1073,7 +1299,6 @@ export default function CanvasWall({
             const visualWidth = noteWidth * scale;
             const visualHeight = (isMobile ? 110 : 120) * scale;
 
-            // Hide notes that are completely outside the screen for performance
             if (
               visualX < -visualWidth ||
               visualX > width + visualWidth ||
@@ -1088,18 +1313,28 @@ export default function CanvasWall({
             const baseZIndex = Math.min(99, notes.length - index);
             const zIndex = isHovered ? 100 : baseZIndex;
 
+            const isNewNote = !appearedNoteIdsRef.current.has(note._id);
+            if (isNewNote) {
+              appearedNoteIdsRef.current.add(note._id);
+            }
+
             return (
               <div
                 key={note._id}
-                className="interactive-note absolute p-4 md:p-5 border border-black shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] hover:shadow-[7px_7px_0px_0px_rgba(0,0,0,1)] hover:-translate-y-0.5 active:translate-y-0.5 cursor-pointer select-text flex flex-col justify-between"
+                data-note-id={note._id}
+                className={`interactive-note absolute p-4 md:p-5 border border-black shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] hover:shadow-[7px_7px_0px_0px_rgba(0,0,0,1)] hover:-translate-y-0.5 active:translate-y-0.5 cursor-pointer select-text flex flex-col justify-between ${
+                  isNewNote ? "animate-note-fade-in" : ""
+                } ${
+                  isHovered ? "ring-2 ring-black scale-105" : ""
+                }`}
                 style={{
-                  left: `${Math.round(note.x - halfNoteWidth)}px`, // Raw coordinate layout inside translated/scaled canvas, rounded to prevent decimals
-                  top: `${Math.round(note.y - 60)}px`,  // Center align based on min-height, rounded to prevent decimals
+                  left: `${Math.round(note.x - halfNoteWidth)}px`,
+                  top: `${Math.round(note.y - 60)}px`,
                   width: `${noteWidth}px`,
                   minHeight: isMobile ? "110px" : "120px",
                   height: "auto",
                   backgroundColor: note.color || "#ffffff",
-                  transition: "transform 0.1s ease, shadow 0.1s ease",
+                  transition: "transform 0.15s ease, shadow 0.15s ease",
                   transformStyle: "preserve-3d",
                   backfaceVisibility: "hidden",
                   willChange: "transform",
@@ -1110,10 +1345,9 @@ export default function CanvasWall({
                 }}
                 onMouseEnter={() => setHoveredNoteId(note._id)}
                 onMouseLeave={() => setHoveredNoteId(null)}
-                onClick={() => setSelectedNote(note)}
               >
                 {/* Text message */}
-                <p 
+                <p
                   className={`text-[11px] md:text-[13px] leading-relaxed mt-1 mb-3 flex-1 select-text ${txtColor}`}
                   style={{
                     fontFamily: note.fontFamily || "Georgia, serif",
@@ -1127,16 +1361,30 @@ export default function CanvasWall({
                 </p>
 
                 {/* Position stamp */}
-                <div className={`pt-1.5 md:pt-2 border-t ${(note.color === "#171717" || note.color === "#000000") ? "border-white/10" : "border-black/10"} flex items-center justify-between text-[7px] md:text-[8px] font-mono ${(note.color === "#171717" || note.color === "#000000") ? "text-neutral-400" : "text-neutral-400"}`}>
-                  <span className={`font-bold tracking-wider ${(note.color === "#171717" || note.color === "#000000") ? "text-white" : "text-black"}`}>LA PARED</span>
-                  <span>X:{note.x} Y:{-note.y}</span>
+                <div
+                  className={`pt-1.5 md:pt-2 border-t ${
+                    note.color === "#171717" || note.color === "#000000"
+                      ? "border-white/10 text-neutral-400"
+                      : "border-black/10 text-neutral-400"
+                  } flex items-center justify-between text-[7px] md:text-[8px] font-mono`}
+                >
+                  <span
+                    className={`font-bold tracking-wider ${
+                      note.color === "#171717" || note.color === "#000000" ? "text-white" : "text-black"
+                    }`}
+                  >
+                    LA PARED
+                  </span>
+                  <span>
+                    X:{note.x} Y:{-note.y}
+                  </span>
                 </div>
               </div>
             );
           })}
         </div>
 
-        {/* Double Click - Creating Note Form Bubble (Remains unscaled for crisp input legibility, but centered over the target cell) */}
+        {/* Double Click - Creating Note Form Bubble */}
         {creatingNote && (
           <div
             id="cuadro-nueva-inscripcion"
@@ -1153,7 +1401,9 @@ export default function CanvasWall({
           >
             <div className="flex items-center justify-between mb-2 pb-2 border-b border-neutral-100 text-[9px] font-mono text-neutral-400">
               <span className="font-bold uppercase tracking-widest text-black">Nueva Inscripción</span>
-              <span>X:{creatingNote.x} Y:{-creatingNote.y}</span>
+              <span>
+                X:{creatingNote.x} Y:{-creatingNote.y}
+              </span>
             </div>
 
             <textarea
@@ -1163,11 +1413,11 @@ export default function CanvasWall({
               value={creatingNote.text}
               onChange={(e) => {
                 const val = e.target.value;
-                if (val.length <= 100) {
+                if (val.length <= 120) {
                   setCreatingNote((prev) => prev && { ...prev, text: val });
                 }
               }}
-              maxLength={100}
+              maxLength={120}
               className="bg-neutral-50 border border-neutral-200 focus:border-black outline-none p-3 text-xs text-black placeholder-neutral-400 flex-1 resize-none mb-1 focus:ring-0"
               style={{
                 fontFamily: creatingNote.fontFamily,
@@ -1177,7 +1427,7 @@ export default function CanvasWall({
             />
 
             <div className="text-[10px] font-mono text-neutral-500 mb-2.5 text-right">
-              Letras: {creatingNote.text.length} / 50
+              Letras: {creatingNote.text.length} / 80
             </div>
 
             {/* Custom Color Selector */}
@@ -1232,7 +1482,7 @@ export default function CanvasWall({
             </div>
 
             {savingError && (
-               <div className="text-[9px] text-red-600 bg-red-50 border border-red-200 p-2 rounded-none mb-2.5 leading-tight font-mono">
+              <div className="text-[9px] text-red-600 bg-red-50 border border-red-200 p-2 rounded-none mb-2.5 leading-tight font-mono">
                 {savingError}
               </div>
             )}
@@ -1248,7 +1498,7 @@ export default function CanvasWall({
               <button
                 id="btn-save-wall"
                 onClick={handleSaveNote}
-                disabled={saving || !creatingNote.text.trim() || creatingNote.text.length > 50}
+                disabled={saving || !creatingNote.text.trim() || creatingNote.text.length > 80}
                 className="flex-1 bg-black text-white hover:bg-neutral-900 disabled:opacity-20 disabled:pointer-events-none text-[10px] font-bold tracking-widest py-2.5 transition-all flex items-center justify-center gap-1.5 uppercase font-mono"
               >
                 {saving ? "GRABANDO..." : "GRABAR"}
@@ -1260,20 +1510,43 @@ export default function CanvasWall({
       </div>
 
       {/* Small Elegant Footer */}
-      <div 
+      <div
         className="wall-ui-element absolute bottom-3 left-6 right-6 flex justify-between items-center text-[9px] text-neutral-400 font-mono pointer-events-none"
         style={{ zIndex: 20 }}
       >
         <span>100% Anónimo & Libre</span>
       </div>
 
+      {/* Floating Action Button (FAB) for Sorpréndeme on Mobile */}
+      <button
+        id="btn-sorprendeme-mobile"
+        onClick={handleSurpriseMe}
+        className="md:hidden wall-ui-element absolute right-6 px-3 py-2 bg-white border border-neutral-300 hover:border-black shadow-[2px_2px_4px_rgba(0,0,0,0.1)] active:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] active:translate-y-0.5 text-xs font-mono font-bold text-black flex items-center gap-1.5 cursor-pointer transition-all hover:scale-105 active:scale-95"
+        style={{
+          zIndex: 25,
+          bottom: isTabletOrMobile
+            ? "calc(env(safe-area-inset-bottom) + 5.5rem + 102px)"
+            : "5.5rem",
+        }}
+        title="Viajar hacia una nota existente de manera inesperada"
+      >
+        <span className="text-xs">🎲</span>
+        <span className="tracking-wider uppercase text-[10px]">Sorpréndeme</span>
+      </button>
+
       {/* Floating Action Button (FAB) for Manual */}
       <button
-        onClick={() => setIsManualOpen(true)}
-        className="wall-ui-element absolute right-6 w-11 h-11 rounded-full bg-white border border-neutral-300 hover:border-black shadow-[2px_2px_4px_rgba(0,0,0,0.1)] hover:shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] flex items-center justify-center text-sm font-mono font-bold text-black transition-all hover:scale-105 active:scale-95 cursor-pointer"
-        style={{ 
+        id="btn-manual-pared"
+        onClick={() => {
+          setIsManualOpen(true);
+          dismissOnboarding();
+        }}
+        className={`wall-ui-element absolute right-6 w-11 h-11 rounded-full bg-white border border-neutral-300 hover:border-black shadow-[2px_2px_4px_rgba(0,0,0,0.1)] hover:shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] flex items-center justify-center text-sm font-mono font-bold text-black transition-all hover:scale-105 active:scale-95 cursor-pointer ${
+          isOnboardingActive ? "ring-2 ring-black/40 animate-pulse" : ""
+        }`}
+        style={{
           zIndex: 25,
-          bottom: isTabletOrMobile ? "calc(env(safe-area-inset-bottom) + 5.5rem + 50px)" : "2.5rem"
+          bottom: isTabletOrMobile ? "calc(env(safe-area-inset-bottom) + 5.5rem + 50px)" : "2.5rem",
         }}
         title="Manual de La Pared"
       >
@@ -1296,15 +1569,17 @@ export default function CanvasWall({
                 <X className="w-4.5 h-4.5" />
               </button>
             </div>
-            
+
             <ul className="text-xs text-neutral-600 space-y-3 font-sans leading-relaxed mb-6">
               <li className="flex gap-2.5">
                 <span className="text-black font-mono font-bold">01/</span>
-                <span>Arrastra el lienzo infinito para navegar por las coordenadas espaciales.</span>
+                <span>Arrastra el lienzo infinito para navegar por las coordenadas espaciales. Puedes arrastrar desde cualquier lugar, incluso encima de una nota.</span>
               </li>
               <li className="flex gap-2.5">
                 <span className="text-black font-mono font-bold">02/</span>
-                <span>Haz <b className="text-black">doble clic</b> en cualquier espacio blanco del lienzo para comenzar una inscripción.</span>
+                <span>
+                  {isMobile ? "Toca dos veces" : "Haz doble clic"} en cualquier espacio del lienzo para comenzar una inscripción de hasta 80 caracteres.
+                </span>
               </li>
               <li className="flex gap-2.5">
                 <span className="text-black font-mono font-bold">03/</span>
@@ -1312,7 +1587,7 @@ export default function CanvasWall({
               </li>
               <li className="flex gap-2.5">
                 <span className="text-black font-mono font-bold">04/</span>
-                <span>Haz clic en cualquier inscripción existente para leerla a detalle y apreciar su ubicación exacta.</span>
+                <span>Toca cualquier inscripción existente para leerla a detalle, o pulsa <b className="text-black">🎲 Sorpréndeme</b> para viajar hacia notas inesperadas.</span>
               </li>
             </ul>
 

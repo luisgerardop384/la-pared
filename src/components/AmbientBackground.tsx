@@ -24,7 +24,7 @@ export default function AmbientBackground() {
       activeKeyRef.current = freshKey;
       setNextAmbient(freshState);
 
-      // Iniciar la transición de desvanecimiento cruzado (cross-fade)
+      // Iniciar transición suave de desvanecimiento cruzado (cross-fade)
       requestAnimationFrame(() => {
         setCrossFadeActive(true);
       });
@@ -38,7 +38,7 @@ export default function AmbientBackground() {
     }
   };
 
-  // Comprobar visibilidad de la pestaña para pausar cuando no esté activa
+  // Comprobar visibilidad de la pestaña para pausar cálculos y animaciones cuando no esté activa
   useEffect(() => {
     const handleVisibilityChange = () => {
       const active = !document.hidden;
@@ -88,10 +88,10 @@ export default function AmbientBackground() {
     return items;
   }, []);
 
-  // Generar datos estáticos de lluvia (posiciones deterministas)
+  // Generar datos estáticos de lluvia (posiciones deterministas hasta el máximo de tormenta)
   const rainDrops = useMemo(() => {
     const items = [];
-    for (let i = 0; i < RAIN_CONFIG.count; i++) {
+    for (let i = 0; i < RAIN_CONFIG.stormCount; i++) {
       const left = pseudoRandom(i * 4 + 1) * 100;
       const height =
         RAIN_CONFIG.minHeightPx +
@@ -108,7 +108,22 @@ export default function AmbientBackground() {
   }, []);
 
   const renderAmbientLayer = (state: AmbientState, opacityVal: number, transitionCss: boolean) => {
-    const { backgroundStyle, showStars, showRain, weather } = state;
+    const { backgroundStyle, showStars, showRain, rainDensity, weather } = state;
+
+    // Número de gotas a renderizar según densidad
+    const dropLimit =
+      rainDensity === 'light'
+        ? RAIN_CONFIG.lightCount
+        : rainDensity === 'heavy'
+        ? RAIN_CONFIG.stormCount
+        : RAIN_CONFIG.normalCount;
+
+    const rainColor =
+      weather === 'storm'
+        ? RAIN_CONFIG.stormColor
+        : rainDensity === 'light'
+        ? RAIN_CONFIG.lightColor
+        : RAIN_CONFIG.normalColor;
 
     return (
       <div
@@ -119,7 +134,7 @@ export default function AmbientBackground() {
           transition: transitionCss ? 'opacity 2s ease-in-out' : 'none',
         }}
       >
-        {/* Capa de Estrellas (sólo de noche sin nubes) */}
+        {/* Capa de Estrellas (sólo de noche despejada o parcialmente nublada) */}
         {showStars && isTabActive && (
           <div className="absolute inset-0 w-full h-full pointer-events-none">
             {stars.map((star) => (
@@ -131,7 +146,7 @@ export default function AmbientBackground() {
                   top: `${star.top}%`,
                   width: `${star.size}px`,
                   height: `${star.size}px`,
-                  opacity: star.opacity,
+                  opacity: weather === 'partly_cloudy' ? star.opacity * 0.6 : star.opacity,
                   boxShadow: '0 0 3px rgba(255, 255, 255, 0.8)',
                   animation: `ambient-twinkle ${star.duration}s ease-in-out ${star.delay}s infinite`,
                 }}
@@ -140,10 +155,10 @@ export default function AmbientBackground() {
           </div>
         )}
 
-        {/* Capa de Lluvia (lluvia / tormenta) */}
+        {/* Capa de Lluvia (lluvia ligera / normal / tormenta) */}
         {showRain && isTabActive && (
           <div className="absolute inset-0 w-full h-full pointer-events-none overflow-hidden">
-            {rainDrops.map((drop) => (
+            {rainDrops.slice(0, dropLimit).map((drop) => (
               <div
                 key={drop.id}
                 className="absolute rounded-full"
@@ -152,8 +167,7 @@ export default function AmbientBackground() {
                   top: `-30px`,
                   width: '1px',
                   height: `${drop.height}px`,
-                  backgroundColor:
-                    weather === 'storm' ? RAIN_CONFIG.stormColor : RAIN_CONFIG.color,
+                  backgroundColor: rainColor,
                   opacity: drop.opacity,
                   transform: `rotate(${RAIN_CONFIG.angleDeg}deg)`,
                   animation: `ambient-rain ${drop.duration}s linear ${drop.delay}s infinite`,

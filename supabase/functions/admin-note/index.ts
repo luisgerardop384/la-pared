@@ -4,16 +4,24 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
 }
 
 serve(async (req) => {
   // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: corsHeaders })
+    return new Response('ok', { status: 200, headers: corsHeaders })
   }
 
   try {
-    const { texto, x, y, color, fuente, client_id, action, password } = await req.json()
+    let body: any = {}
+    try {
+      body = await req.json()
+    } catch (_) {
+      body = {}
+    }
+
+    const { texto, x, y, color, fuente, client_id, action, password } = body
 
     // Retrieve secret administrative password
     const adminPassword = Deno.env.get("ADMIN_PASSWORD")
@@ -99,10 +107,10 @@ serve(async (req) => {
       )
     }
 
-    // Strict character limit check of 50 characters
-    if (textTrimmed.length > 50) {
+    // Strict character limit check of 80 characters
+    if (textTrimmed.length > 80) {
       return new Response(
-        JSON.stringify({ error: "La inscripción no puede exceder los 50 caracteres." }),
+        JSON.stringify({ error: "La inscripción no puede exceder los 80 caracteres." }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       )
     }
