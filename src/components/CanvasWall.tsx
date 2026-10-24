@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Compass, Plus, Sparkles, HelpCircle, X } from "lucide-react";
+import { Compass, Plus, Sparkles, HelpCircle, X, MessageSquare } from "lucide-react";
 import { Note } from "../types";
 import { supabase } from '../supabaseClient';
 import AmbientBackground from "./AmbientBackground";
+import LaSalaModal from "./LaSalaModal";
 
 interface CanvasWallProps {
   clientId: string;
@@ -90,6 +91,9 @@ export default function CanvasWall({
   });
   const MIN_SCALE = 0.35;
   const MAX_SCALE = 1.8;
+
+  // La Sala ephemeral chat modal state
+  const [isSalaOpen, setIsSalaOpen] = useState(false);
 
   // Onboarding first visit state (stored in localStorage only)
   const [isOnboardingActive, setIsOnboardingActive] = useState(() => {
@@ -1216,6 +1220,17 @@ export default function CanvasWall({
               </span>
             </div>
           </div>
+
+          {/* 💬 LA SALA Button */}
+          <button
+            id="btn-la-sala"
+            onClick={() => setIsSalaOpen(true)}
+            className="gallery-ui px-3.5 py-1.5 md:px-4 md:py-2.5 shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] md:shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] bg-white border border-black hover:bg-neutral-50 active:translate-y-0.5 text-xs font-mono font-bold text-black flex items-center gap-1.5 md:gap-2 cursor-pointer transition-all hover:shadow-[5px_5px_0px_0px_rgba(0,0,0,1)]"
+            title="Entrar a La Sala efímera"
+          >
+            <MessageSquare className="w-3.5 h-3.5 text-black" />
+            <span className="tracking-wider uppercase text-[10px] md:text-xs">La Sala</span>
+          </button>
         </div>
       </div>
 
@@ -1620,6 +1635,13 @@ export default function CanvasWall({
           </div>
         </div>
       )}
+
+      {/* La Sala Ephemeral Chat Modal */}
+      <LaSalaModal
+        clientId={clientId}
+        isOpen={isSalaOpen}
+        onClose={() => setIsSalaOpen(false)}
+      />
     </div>
   );
 }

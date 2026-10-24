@@ -1,0 +1,13 @@
+name = "la-sala"
+main = "sala-worker.ts"
+compatibility_date = "2024-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+[durable_objects]
+bindings = [
+  { name = "SALA_ROOM", class_name = "SalaRoom" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SalaRoom"]
