@@ -3,22 +3,20 @@
  * Implementación de servidor para "La Sala" en Cloudflare Workers.
  *
  * Características:
- * - Matchmaking automático: salas independientes con tope estricto de máximo 5 usuarios reales por sala.
+ * - Matchmaking global real: todas las peticiones convergen en la misma instancia de Durable Object ("sala_global").
+ * - Búsqueda de sala con espacio disponible (< 5 usuarios reales) antes de crear una nueva.
+ * - Límite estricto de máximo 5 usuarios reales por sala.
+ * - Presencia de IA (Gemini):
+ *   - Si hay exactamente 1 usuario real en la sala, Gemini conversa con él.
+ *   - Si entran 2 o más usuarios reales, Gemini se desactiva y deja de responder de inmediato.
+ *   - Si la sala vuelve a tener exactamente 1 usuario, Gemini regresa.
  * - Totalmente anónimo: no se transmiten nombres, avatares ni IDs personales en los mensajes.
  * - Autoridad del servidor sobre sesiones:
  *   - Ventana estricta de 5 minutos (300 s) por sesión desde el ingreso inicial.
- *   - Si el usuario se desconecta o recarga, el tiempo de sesión sigue corriendo en el servidor y puede reanudarlo.
- *   - Al llegar a 00:00 (5 min completos), se cierra la conexión y se activa una espera obligatoria (cooldown)
- *     inquebrantable de exactamente 10 minutos (600 s) protegida por el servidor.
- *   - Los datos de sesión persisten en el storage del Durable Object para resistir reinicios o cold-starts.
- * - Mensajes efímeros de exactamente 15 segundos: se autodestruyen en memoria y notifican a los clientes (0 persistencia).
- * - IA conversacional de servidor (Gemini API):
- *   - Activa únicamente si hay exactamente 1 usuario real en la sala.
- *   - Si entra una segunda persona o la sala queda vacía, la IA sale de inmediato y cancela acciones.
- *   - Saludo casual a los 2.5s si la sala está vacía.
- *   - Personalidad 100% idéntica a server.ts (casual, breve, proporción natural, honesta si preguntan si es IA).
- *   - Cascada de modelos (gemini-3.5-flash prioritario) con circuit breaker para errores 429 / 503 / timeouts.
- *   - Motor de respaldo inteligente contextual idéntico con normalización de diacríticos y seguimiento temático.
+ *   - Cooldown obligatorio de 10 minutos (600 s) tras expirar los 5 minutos.
+ *   - Los datos de sesión persisten en el storage del Durable Object para resistir reinicios.
+ * - Mensajes efímeros de exactamente 15 segundos con notificación de expiración a los clientes.
+ * - Reanálisis seguro de reconexiones sin duplicar cupos ni corromper el conteo de usuarios.
  */
 
 export interface Env {
@@ -56,7 +54,7 @@ const AI_SYSTEM_PROMPT =
   "9. SINCERIDAD SOBRE SER IA: Si te preguntan si eres una IA, bot, humano o persona real, responde con sincera naturalidad (ej: 'sí jaja, soy una IA', 'sí, soy un bot mientras no entra nadie'). Nunca afirmes ser humano ni inventes vivencias personales falsas (familia, infancia, pareja). Si no te lo preguntan, nunca digas 'como IA...'.\n" +
   "10. VARIEDAD: Genera respuestas variadas según el contexto, sin caer en respuestas predeterminadas repetitivas. Español informal y cotidiano.";
 
-// Motor de respaldo contextual multi-turno idéntico a server.ts
+// Motor de respaldo contextual multi-turno idéntico
 function getContextualFallback(
   userPrompt?: string,
   history: Array<{ role: string; text: string }> = []
@@ -302,17 +300,79 @@ interface EphemeralMessage {
   model?: string;
 }
 
+interface RoomClient {
+  clientId: string;
+  ws: WebSocket;
+  sessionExpiresAt: number;
+}
+
 // Circuit breaker en memoria de la instancia DO para controlar modelos con 429/503
 const modelCooldowns = new Map<string, number>();
 
+// Representación de una Sala en vivo dentro del Durable Object
+class ActiveRoom {
+  id: string;
+  clients = new Map<string, RoomClient>();
+  activeMessages = new Map<string, EphemeralMessage>();
+  conversationContext: Array<{ role: "user" | "ia"; text: string }> = [];
+  aiActive = false;
+  aiTypingTimeout: any = null;
+  messageTimers = new Map<string, any>();
+
+  constructor(id: string) {
+    this.id = id;
+  }
+
+  get realUserCount(): number {
+    return this.clients.size;
+  }
+
+  isFull(): boolean {
+    return this.clients.size >= MAX_USERS_PER_ROOM;
+  }
+}
+
 // ============================================================================
-// WORKER ENTRY POINT (Enrutador global y Matchmaking)
+// DURABLE OBJECT: SalaRoom
+// Actúa como el Coordinador Global y Gestor de Salas en una única instancia
+// compartida ("sala_global"), eliminando inconsistencias y desincronizaciones.
 // ============================================================================
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+export class SalaRoom implements DurableObject {
+  state: DurableObjectState;
+  env: Env;
+
+  // Estado persistente en storage (sesiones de 5m / cooldown 10m)
+  sessions = new Map<string, UserSession>();
+
+  // Estado en memoria de salas activas
+  rooms = new Map<string, ActiveRoom>();
+  clientRoomMap = new Map<string, string>(); // clientId -> roomId
+
+  heartbeatInterval: any = null;
+
+  constructor(state: DurableObjectState, env: Env) {
+    this.state = state;
+    this.env = env;
+
+    // Cargar sesiones persistentes del almacenamiento SQLite / Storage
+    this.state.blockConcurrencyWhile(async () => {
+      const storedSessions = await this.state.storage.get<Record<string, UserSession>>("sessions");
+      if (storedSessions) {
+        for (const [k, v] of Object.entries(storedSessions)) {
+          this.sessions.set(k, v);
+        }
+      }
+    });
+
+    // Iniciar verificación continua de expiración de sesiones (5 minutos)
+    this.heartbeatInterval = setInterval(() => {
+      this.checkExpiredSessions();
+    }, 1000);
+  }
+
+  async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    // Cabeceras CORS para comunicación segura desde la app web
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -323,24 +383,29 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // Instancia única del Coordinador Global (gestión de sesiones y matchmaking de salas)
-    const coordinatorId = env.SALA_ROOM.idFromName("global_coordinator");
-    const coordinatorStub = env.SALA_ROOM.get(coordinatorId);
+    const now = Date.now();
 
     // 1. Endpoint /api/sala/status
     if (url.pathname === "/api/sala/status") {
-      const response = await coordinatorStub.fetch(request);
-      const data = await response.text();
-      return new Response(data, {
+      const clientId = url.searchParams.get("clientId") || "";
+      const status = this.getUserSessionStatus(clientId, now);
+      return new Response(JSON.stringify(status), {
         headers: { "Content-Type": "application/json", ...corsHeaders },
       });
     }
 
     // 2. Endpoint /api/sala/leave
     if (url.pathname === "/api/sala/leave") {
-      const response = await coordinatorStub.fetch(request);
-      const data = await response.text();
-      return new Response(data, {
+      let clientId = url.searchParams.get("clientId") || "";
+      if (!clientId && request.method === "POST") {
+        try {
+          const body: any = await request.json();
+          clientId = body.clientId || "";
+        } catch (_) {}
+      }
+      this.leaveRoom(clientId);
+      const status = this.getUserSessionStatus(clientId, now);
+      return new Response(JSON.stringify({ success: true, ...status }), {
         headers: { "Content-Type": "application/json", ...corsHeaders },
       });
     }
@@ -357,199 +422,39 @@ export default {
         return new Response("Missing clientId", { status: 400, headers: corsHeaders });
       }
 
-      // Validar sesión y matchmaking con el coordinador
-      const matchRequest = new Request("http://internal/coordinator/match", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ clientId }),
-      });
-      const matchRes = await coordinatorStub.fetch(matchRequest);
-      const matchData: any = await matchRes.json();
-
-      if (!matchData.allowed) {
-        // Enviar respuesta en cooldown
+      // Validar ventana de sesión y cooldown de 10 min
+      const sessionCheck = this.startOrResumeUserSession(clientId, now);
+      if (!sessionCheck.allowed) {
         const pair = new WebSocketPair();
         const [clientWs, serverWs] = Object.values(pair);
         serverWs.accept();
         serverWs.send(
           JSON.stringify({
             type: "in_cooldown",
-            remainingCooldownSeconds: matchData.remainingCooldownSeconds,
+            remainingCooldownSeconds: sessionCheck.remainingCooldownSeconds,
           })
         );
         serverWs.close(4002, "In cooldown");
         return new Response(null, { status: 101, webSocket: clientWs });
       }
 
-      // Redirigir el WebSocket al Durable Object específico de la sala asignada (< 5 usuarios)
-      const roomId = matchData.roomId;
-      const roomStub = env.SALA_ROOM.get(env.SALA_ROOM.idFromName("room_" + roomId));
-
-      const roomWsRequest = new Request(request.url, {
-        headers: {
-          ...Object.fromEntries(request.headers.entries()),
-          "X-Sala-Room-Id": roomId,
-          "X-Sala-Session-Expires": String(matchData.sessionExpiresAt),
-        },
-      });
-
-      return roomStub.fetch(roomWsRequest);
-    }
-
-    return new Response("La Sala Cloudflare Worker - Operativo", { status: 200, headers: corsHeaders });
-  },
-};
-
-// ============================================================================
-// DURABLE OBJECT: SalaRoom
-// Actúa en 2 roles según su ID:
-// 1) "global_coordinator": Administra sesiones de 5m/cooldown 10m y matchmaking (< 5 usuarios).
-// 2) "room_<id>": Maneja la sala en vivo, WebSockets, mensajes efímeros 15s y Gemini IA.
-// ============================================================================
-export class SalaRoom implements DurableObject {
-  state: DurableObjectState;
-  env: Env;
-  isCoordinator: boolean = false;
-
-  // Estado del Coordinador (persiste en storage)
-  sessions = new Map<string, UserSession>();
-  roomOccupancy = new Map<string, number>(); // roomId -> count
-
-  // Estado de Sala Individual (en memoria en vivo de la sala)
-  roomId: string = "";
-  activeClients = new Map<string, { ws: WebSocket; sessionExpiresAt: number }>();
-  activeMessages = new Map<string, EphemeralMessage>();
-  conversationContext: Array<{ role: "user" | "ia"; text: string }> = [];
-  aiActive = false;
-  aiTypingTimeout: any = null;
-  heartbeatInterval: any = null;
-
-  constructor(state: DurableObjectState, env: Env) {
-    this.state = state;
-    this.env = env;
-
-    // Cargar sesiones persistentes del storage si es el coordinador
-    this.state.blockConcurrencyWhile(async () => {
-      const storedSessions = await this.state.storage.get<Record<string, UserSession>>("sessions");
-      if (storedSessions) {
-        for (const [k, v] of Object.entries(storedSessions)) {
-          this.sessions.set(k, v);
-        }
-      }
-    });
-  }
-
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-
-    // ========================================================================
-    // A) MODO COORDINADOR
-    // ========================================================================
-    if (url.pathname.startsWith("/coordinator/") || url.pathname === "/api/sala/status" || url.pathname === "/api/sala/leave") {
-      this.isCoordinator = true;
-      return this.handleCoordinatorRequest(request, url);
-    }
-
-    // ========================================================================
-    // B) MODO SALA INDIVIDUAL
-    // ========================================================================
-    this.roomId = request.headers.get("X-Sala-Room-Id") || "default";
-    const clientId = url.searchParams.get("clientId");
-    const sessionExpiresAt = Number(request.headers.get("X-Sala-Session-Expires")) || (Date.now() + SESSION_DURATION_MS);
-
-    if (url.pathname === "/api/sala/ws") {
-      if (!clientId) {
-        return new Response("Missing clientId", { status: 400 });
-      }
-
+      // Crear par WebSocket para el cliente
       const pair = new WebSocketPair();
       const [clientWs, serverWs] = Object.values(pair);
       serverWs.accept();
 
-      this.handleRoomWebSocket(clientId, serverWs, sessionExpiresAt);
+      // Emparejar en sala disponible (< 5 usuarios)
+      this.handleClientWebSocket(clientId, serverWs, sessionCheck.sessionExpiresAt);
 
       return new Response(null, { status: 101, webSocket: clientWs });
     }
 
-    return new Response("Not found", { status: 404 });
+    return new Response("La Sala Cloudflare Worker - Operativo", { status: 200, headers: corsHeaders });
   }
 
   // --------------------------------------------------------------------------
-  // Lógica del Coordinador (Sesiones, Cooldown y Matchmaking de Salas)
+  // Control de Sesiones y Cooldown
   // --------------------------------------------------------------------------
-  async handleCoordinatorRequest(request: Request, url: URL): Promise<Response> {
-    const now = Date.now();
-
-    // 1. Status Check
-    if (url.pathname === "/api/sala/status") {
-      const clientId = url.searchParams.get("clientId") || "";
-      const status = this.getUserSessionStatus(clientId, now);
-      return Response.json(status);
-    }
-
-    // 2. Leave Presence
-    if (url.pathname === "/api/sala/leave") {
-      let clientId = url.searchParams.get("clientId") || "";
-      if (!clientId && request.method === "POST") {
-        try {
-          const body: any = await request.json();
-          clientId = body.clientId || "";
-        } catch (_) {}
-      }
-      const status = this.getUserSessionStatus(clientId, now);
-      return Response.json({ success: true, ...status });
-    }
-
-    // 3. Matchmaking interno para asignar sala con < 5 usuarios
-    if (url.pathname === "/coordinator/match") {
-      const body: any = await request.json();
-      const clientId = body.clientId || "";
-
-      const check = this.startOrResumeUserSession(clientId, now);
-      if (!check.allowed) {
-        return Response.json({
-          allowed: false,
-          remainingCooldownSeconds: check.remainingCooldownSeconds,
-        });
-      }
-
-      // Buscar sala activa con < 5 participantes
-      let assignedRoomId = "";
-      for (const [rId, count] of this.roomOccupancy.entries()) {
-        if (count < MAX_USERS_PER_ROOM) {
-          assignedRoomId = rId;
-          break;
-        }
-      }
-
-      if (!assignedRoomId) {
-        assignedRoomId = "sala_" + Math.random().toString(36).substring(2, 8);
-      }
-
-      return Response.json({
-        allowed: true,
-        roomId: assignedRoomId,
-        sessionExpiresAt: check.sessionExpiresAt,
-        remainingSessionSeconds: check.remainingSessionSeconds,
-      });
-    }
-
-    // 4. Actualización de ocupación enviada por una sala
-    if (url.pathname === "/coordinator/update-occupancy") {
-      const body: any = await request.json();
-      const rId = body.roomId;
-      const count = body.count;
-      if (count <= 0) {
-        this.roomOccupancy.delete(rId);
-      } else {
-        this.roomOccupancy.set(rId, count);
-      }
-      return Response.json({ success: true });
-    }
-
-    return new Response("Unknown coordinator command", { status: 404 });
-  }
-
   getUserSessionStatus(clientId: string, now: number) {
     const session = this.sessions.get(clientId);
     if (!session) {
@@ -561,7 +466,7 @@ export class SalaRoom implements DurableObject {
       };
     }
 
-    // 1. Sesión activa en curso
+    // Sesión activa en curso
     if (now < session.sessionExpiresAt) {
       return {
         inCooldown: false,
@@ -571,7 +476,7 @@ export class SalaRoom implements DurableObject {
       };
     }
 
-    // 2. Sesión expirada, en cooldown estricto de 10 min
+    // Sesión expirada, en cooldown estricto de 10 min
     const cooldownExpiresAt = session.sessionExpiresAt + COOLDOWN_DURATION_MS;
     if (now < cooldownExpiresAt) {
       return {
@@ -582,7 +487,7 @@ export class SalaRoom implements DurableObject {
       };
     }
 
-    // 3. Cooldown finalizado
+    // Cooldown finalizado
     return {
       inCooldown: false,
       remainingCooldownSeconds: 0,
@@ -596,7 +501,7 @@ export class SalaRoom implements DurableObject {
 
     if (session) {
       const cooldownExpiresAt = session.sessionExpiresAt + COOLDOWN_DURATION_MS;
-      // En cooldown: rechazar
+      // En cooldown de 10 min: rechazar
       if (now >= session.sessionExpiresAt && now < cooldownExpiresAt) {
         return {
           allowed: false,
@@ -606,7 +511,7 @@ export class SalaRoom implements DurableObject {
         };
       }
 
-      // Sesión aún válida: reanudar
+      // Sesión aún válida dentro de sus 5 min: reanudar
       if (now < session.sessionExpiresAt) {
         return {
           allowed: true,
@@ -625,8 +530,6 @@ export class SalaRoom implements DurableObject {
       sessionExpiresAt,
     };
     this.sessions.set(clientId, session);
-
-    // Persistir en storage del Durable Object
     this.saveSessionsToStorage();
 
     return {
@@ -645,122 +548,144 @@ export class SalaRoom implements DurableObject {
     await this.state.storage.put("sessions", obj);
   }
 
-  // --------------------------------------------------------------------------
-  // Lógica de Sala Individual (WebSockets, Mensajes Efímeros 15s y Gemini)
-  // --------------------------------------------------------------------------
-  handleRoomWebSocket(clientId: string, ws: WebSocket, sessionExpiresAt: number) {
-    this.activeClients.set(clientId, { ws, sessionExpiresAt });
-    this.notifyOccupancyChange();
-    this.evaluateParticipantCount();
-
-    // Inicializar sesión y sincronizar mensajes activos con tiempo restante
+  checkExpiredSessions() {
     const now = Date.now();
-    const remainingSec = Math.max(1, Math.ceil((sessionExpiresAt - now) / 1000));
-    const activeList = Array.from(this.activeMessages.values()).map((m) => {
-      const elapsed = now - m.timestamp;
-      const remaining = Math.max(0, m.durationMs - elapsed);
-      return { ...m, durationMs: remaining };
-    });
-
-    ws.send(
-      JSON.stringify({
-        type: "session_init",
-        remainingSessionSeconds: remainingSec,
-        activeMessages: activeList,
-      })
-    );
-
-    // Heartbeat periódico para verificar fin de sesión de 5 minutos
-    if (!this.heartbeatInterval) {
-      this.heartbeatInterval = setInterval(() => {
-        const curTime = Date.now();
-        for (const [cId, client] of this.activeClients.entries()) {
-          if (curTime >= client.sessionExpiresAt) {
-            const cooldownExpiresAt = client.sessionExpiresAt + COOLDOWN_DURATION_MS;
-            const remainingCooldown = Math.max(1, Math.ceil((cooldownExpiresAt - curTime) / 1000));
-            try {
-              client.ws.send(
-                JSON.stringify({
-                  type: "session_expired",
-                  remainingCooldownSeconds: remainingCooldown,
-                })
-              );
-              client.ws.close(4001, "Session Expired");
-            } catch (_) {}
-            this.activeClients.delete(cId);
-            this.notifyOccupancyChange();
-            this.evaluateParticipantCount();
-          }
+    for (const room of this.rooms.values()) {
+      for (const [cId, client] of room.clients.entries()) {
+        if (now >= client.sessionExpiresAt) {
+          const cooldownExpiresAt = client.sessionExpiresAt + COOLDOWN_DURATION_MS;
+          const remainingCooldown = Math.max(1, Math.ceil((cooldownExpiresAt - now) / 1000));
+          try {
+            client.ws.send(
+              JSON.stringify({
+                type: "session_expired",
+                remainingCooldownSeconds: remainingCooldown,
+              })
+            );
+            client.ws.close(4001, "Session Expired");
+          } catch (_) {}
+          this.leaveRoom(cId);
         }
-      }, 1000);
+      }
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Matchmaking Global de Salas (Máximo 5 usuarios por sala)
+  // --------------------------------------------------------------------------
+  getOrCreateAvailableRoom(): ActiveRoom {
+    // 1. Buscar primero una sala existente con espacio disponible (< 5 usuarios reales)
+    for (const room of this.rooms.values()) {
+      if (!room.isFull()) {
+        return room;
+      }
     }
 
-    // Receptor de mensajes del cliente
-    ws.addEventListener("message", (event) => {
-      try {
-        const data = JSON.parse(event.data as string);
-
-        if (data.type === "leave_sala") {
-          this.activeClients.delete(clientId);
-          this.notifyOccupancyChange();
-          this.evaluateParticipantCount();
-          ws.close(1000, "User Left");
-          return;
-        }
-
-        if (data.type === "send_message") {
-          const clientData = this.activeClients.get(clientId);
-          if (!clientData || Date.now() >= clientData.sessionExpiresAt) {
-            ws.send(JSON.stringify({ type: "error", error: "Tu tiempo en La Sala ha terminado." }));
-            return;
-          }
-
-          const text = (data.text || "").trim();
-          if (!text || text.length > 180) {
-            ws.send(JSON.stringify({ type: "error", error: "El mensaje debe tener entre 1 y 180 caracteres." }));
-            return;
-          }
-
-          const urlRegex = /(https?:\/\/|www\.|\.com|\.org|\.net|\.io|\.me)/i;
-          if (urlRegex.test(text)) {
-            ws.send(JSON.stringify({ type: "error", error: "No se permiten enlaces en La Sala." }));
-            return;
-          }
-
-          // Agregar mensaje de usuario y emitir
-          this.addMessage(text, false, clientId);
-        }
-      } catch (_) {}
-    });
-
-    ws.addEventListener("close", () => {
-      this.activeClients.delete(clientId);
-      this.notifyOccupancyChange();
-      this.evaluateParticipantCount();
-    });
-
-    ws.addEventListener("error", () => {
-      this.activeClients.delete(clientId);
-      this.notifyOccupancyChange();
-      this.evaluateParticipantCount();
-    });
+    // 2. Si no hay salas disponibles o todas están llenas, crear una nueva sala
+    const newRoomId = "sala_" + Math.random().toString(36).substring(2, 9);
+    const newRoom = new ActiveRoom(newRoomId);
+    this.rooms.set(newRoomId, newRoom);
+    return newRoom;
   }
 
-  notifyOccupancyChange() {
-    const coordinatorId = this.env.SALA_ROOM.idFromName("global_coordinator");
-    const coordinatorStub = this.env.SALA_ROOM.get(coordinatorId);
-    coordinatorStub.fetch(
-      new Request("http://internal/coordinator/update-occupancy", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ roomId: this.roomId, count: this.activeClients.size }),
-      })
-    ).catch(() => {});
+  joinRoom(clientId: string, ws: WebSocket, sessionExpiresAt: number): ActiveRoom {
+    const existingRoomId = this.clientRoomMap.get(clientId);
+    let room: ActiveRoom | undefined;
+
+    // Si el usuario ya estaba registrado en una sala (ej. reconexión / recarga)
+    if (existingRoomId && this.rooms.has(existingRoomId)) {
+      room = this.rooms.get(existingRoomId)!;
+      const oldClient = room.clients.get(clientId);
+      if (oldClient && oldClient.ws !== ws) {
+        try {
+          oldClient.ws.close(1000, "Reconnected");
+        } catch (_) {}
+      }
+      room.clients.set(clientId, { clientId, ws, sessionExpiresAt });
+    } else {
+      // Si no estaba en ninguna sala, buscar una con espacio o crear una nueva
+      this.leaveRoom(clientId);
+      room = this.getOrCreateAvailableRoom();
+      room.clients.set(clientId, { clientId, ws, sessionExpiresAt });
+      this.clientRoomMap.set(clientId, room.id);
+    }
+
+    this.handleParticipantCountChange(room);
+    return room;
   }
 
-  broadcast(payload: any) {
+  leaveRoom(clientId: string) {
+    const roomId = this.clientRoomMap.get(clientId);
+    if (!roomId) return;
+
+    this.clientRoomMap.delete(clientId);
+    const room = this.rooms.get(roomId);
+    if (room) {
+      room.clients.delete(clientId);
+      this.handleParticipantCountChange(room);
+
+      // Si la sala queda completamente vacía, limpiar timers y destruirla
+      if (room.realUserCount === 0) {
+        for (const timer of room.messageTimers.values()) {
+          clearTimeout(timer);
+        }
+        room.messageTimers.clear();
+        if (room.aiTypingTimeout) {
+          clearTimeout(room.aiTypingTimeout);
+          room.aiTypingTimeout = null;
+        }
+        this.rooms.delete(roomId);
+      }
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Gestión de Presencia de la IA en Sala
+  // --------------------------------------------------------------------------
+  handleParticipantCountChange(room: ActiveRoom) {
+    const count = room.realUserCount;
+
+    if (count === 1) {
+      // EXACTAMENTE 1 USUARIO REAL: ENTRA LA IA
+      if (!room.aiActive) {
+        room.aiActive = true;
+        this.scheduleAiInitialGreeting(room);
+      }
+    } else {
+      // 2 O MÁS USUARIOS REALES (O SALA VACÍA): LA IA SE RETIRA DE INMEDIATO
+      if (room.aiActive) {
+        room.aiActive = false;
+        if (room.aiTypingTimeout) {
+          clearTimeout(room.aiTypingTimeout);
+          room.aiTypingTimeout = null;
+        }
+        room.conversationContext = [];
+      }
+      if (count === 0) {
+        room.conversationContext = [];
+        room.activeMessages.clear();
+      }
+    }
+  }
+
+  scheduleAiInitialGreeting(room: ActiveRoom) {
+    if (room.conversationContext.length === 0) {
+      room.aiTypingTimeout = setTimeout(() => {
+        if (room.aiActive && room.realUserCount === 1 && room.conversationContext.length === 0) {
+          const idx = Math.floor(Math.random() * INITIAL_GREETINGS.length);
+          this.addMessage(room, INITIAL_GREETINGS[idx], true, undefined, "fallback");
+        }
+      }, 2500);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Emisión de Mensajes y Ciclo Efímero (15 Segundos)
+  // --------------------------------------------------------------------------
+  broadcast(room: ActiveRoom, payload: any, excludeClientId?: string) {
     const raw = JSON.stringify(payload);
-    for (const client of this.activeClients.values()) {
+    for (const [cId, client] of room.clients.entries()) {
+      if (excludeClientId && cId === excludeClientId) continue;
       try {
         client.ws.send(raw);
       } catch (_) {}
@@ -768,6 +693,7 @@ export class SalaRoom implements DurableObject {
   }
 
   addMessage(
+    room: ActiveRoom,
     text: string,
     isFromAi = false,
     senderClientId?: string,
@@ -775,7 +701,7 @@ export class SalaRoom implements DurableObject {
     model?: string
   ) {
     const msgId = "msg_" + Math.random().toString(36).substring(2, 9) + Date.now();
-    const msg: EphemeralMessage = {
+    const message: EphemeralMessage = {
       id: msgId,
       text,
       timestamp: Date.now(),
@@ -785,73 +711,43 @@ export class SalaRoom implements DurableObject {
       model: isFromAi ? model : undefined,
     };
 
-    this.activeMessages.set(msgId, msg);
+    room.activeMessages.set(msgId, message);
 
-    // Contexto conversacional efímero
-    this.conversationContext.push({
-      role: isFromAi ? "ia" : "user",
-      text,
-    });
-    if (this.conversationContext.length > 10) {
-      this.conversationContext.shift();
+    // Contexto conversacional efímero para Gemini (solo cuando hay 1 usuario real)
+    if (room.realUserCount === 1) {
+      room.conversationContext.push({
+        role: isFromAi ? "ia" : "user",
+        text,
+      });
+      if (room.conversationContext.length > 10) {
+        room.conversationContext.shift();
+      }
     }
 
-    // Broadcast inmediato
-    this.broadcast({
+    // Broadcast inmediato a todos los participantes conectados a la sala
+    this.broadcast(room, {
       type: "message_new",
-      message: msg,
+      message,
     });
 
     // Expiración estricta a los 15 segundos
-    setTimeout(() => {
-      this.activeMessages.delete(msgId);
-      this.broadcast({
+    const timer = setTimeout(() => {
+      room.activeMessages.delete(msgId);
+      room.messageTimers.delete(msgId);
+      this.broadcast(room, {
         type: "message_expired",
         id: msgId,
       });
     }, MESSAGE_LIFESPAN_MS);
+    room.messageTimers.set(msgId, timer);
 
-    // Si es mensaje de usuario y la IA está activa (1 usuario real), evaluar participación
-    if (!isFromAi && this.aiActive && this.activeClients.size === 1) {
-      this.evaluateAiParticipation(text);
+    // Evaluar participación de la IA ÚNICAMENTE si hay exactamente 1 usuario real
+    if (!isFromAi && room.aiActive && room.realUserCount === 1) {
+      this.evaluateAiParticipation(room, text);
     }
   }
 
-  evaluateParticipantCount() {
-    const count = this.activeClients.size;
-    if (count === 1) {
-      if (!this.aiActive) {
-        this.aiActive = true;
-        this.scheduleAiGreeting();
-      }
-    } else {
-      if (this.aiActive) {
-        this.aiActive = false;
-        if (this.aiTypingTimeout) {
-          clearTimeout(this.aiTypingTimeout);
-          this.aiTypingTimeout = null;
-        }
-        this.conversationContext = [];
-      }
-      if (count === 0) {
-        this.conversationContext = [];
-        this.activeMessages.clear();
-      }
-    }
-  }
-
-  scheduleAiGreeting() {
-    if (this.conversationContext.length === 0) {
-      this.aiTypingTimeout = setTimeout(() => {
-        if (this.aiActive && this.activeClients.size === 1 && this.conversationContext.length === 0) {
-          const idx = Math.floor(Math.random() * INITIAL_GREETINGS.length);
-          this.addMessage(INITIAL_GREETINGS[idx], true);
-        }
-      }, 2500);
-    }
-  }
-
-  evaluateAiParticipation(userMessage: string) {
+  evaluateAiParticipation(room: ActiveRoom, userMessage: string) {
     const trimmed = userMessage.trim();
 
     // 1. Pregunta sobre identidad de IA: responder siempre con honestidad
@@ -859,7 +755,7 @@ export class SalaRoom implements DurableObject {
       /(\beres\b.*\b(ia|ai|bot|robot|humano|humana|persona|real)\b|\bque\b\s+eres\b|\bquien\b\s+eres\b)/i.test(trimmed);
 
     if (isIdentityQuestion) {
-      this.scheduleAiResponse(userMessage);
+      this.scheduleAiResponse(room, userMessage);
       return;
     }
 
@@ -867,7 +763,7 @@ export class SalaRoom implements DurableObject {
     const isClosure = /^(ok|vale|ya|ah|ahh|bueno|sip|nop|👍|va|sale)$/i.test(trimmed);
     if (isClosure) return;
 
-    // 3. Preguntas o temas
+    // 3. Preguntas o temas relevantes
     const isQuestionOrTopic =
       trimmed.includes("?") ||
       trimmed.includes("¿") ||
@@ -882,35 +778,35 @@ export class SalaRoom implements DurableObject {
     }
 
     if (shouldRespond) {
-      this.scheduleAiResponse(userMessage);
+      this.scheduleAiResponse(room, userMessage);
     }
   }
 
-  scheduleAiResponse(userMessage: string) {
-    if (this.aiTypingTimeout) {
-      clearTimeout(this.aiTypingTimeout);
+  scheduleAiResponse(room: ActiveRoom, userMessage: string) {
+    if (room.aiTypingTimeout) {
+      clearTimeout(room.aiTypingTimeout);
     }
 
     const delay = 800 + Math.random() * 800;
-    this.aiTypingTimeout = setTimeout(() => {
-      if (this.aiActive && this.activeClients.size === 1) {
-        this.generateAiMessage(userMessage);
+    room.aiTypingTimeout = setTimeout(() => {
+      if (room.aiActive && room.realUserCount === 1) {
+        this.generateAiMessage(room, userMessage);
       }
     }, delay);
   }
 
-  async generateAiMessage(userPrompt?: string) {
-    if (!this.aiActive || this.activeClients.size !== 1) return;
+  async generateAiMessage(room: ActiveRoom, userPrompt?: string) {
+    // Si ya entraron más personas o la sala quedó vacía, abortar inmediatamente
+    if (!room.aiActive || room.realUserCount !== 1) return;
 
     let aiText = "";
     let usedEngine: "gemini" | "fallback" = "fallback";
     let usedModel: string | undefined = undefined;
 
-    // Si la clave de Gemini está configurada en los Secrets del Worker
     if (this.env.GEMINI_API_KEY) {
       try {
-        const past = this.conversationContext.filter(
-          (m, idx) => !(idx === this.conversationContext.length - 1 && m.text.trim() === (userPrompt || "").trim())
+        const past = room.conversationContext.filter(
+          (m, idx) => !(idx === room.conversationContext.length - 1 && m.text.trim() === (userPrompt || "").trim())
         ).slice(-6);
 
         const structuredContents: Array<{ role: "user" | "model"; parts: Array<{ text: string }> }> = [];
@@ -939,10 +835,9 @@ export class SalaRoom implements DurableObject {
         }
 
         console.log(
-          `[DIAGNÓSTICO LA SALA] Turno entrante | Historial recibido: ${past.length} turnos previas [${historyRolesSummary.join(" -> ") || "ninguna"}] | Longitud del prompt: ${promptLen} chars`
+          `[DIAGNÓSTICO LA SALA] Turno entrante | Historial recibido: ${past.length} turnos previas [${historyRolesSummary.join(" -> ") || "ninguna"}] | Longitud prompt: ${promptLen} chars`
         );
 
-        // Cascada de modelos optimizada
         const modelsToTry = [
           "gemini-3.5-flash",
           "gemini-3.1-flash-lite-preview",
@@ -956,12 +851,12 @@ export class SalaRoom implements DurableObject {
         for (const model of modelsToTry) {
           const cooldownUntil = modelCooldowns.get(model) || 0;
           if (Date.now() < cooldownUntil) {
-            console.log(`[DIAGNÓSTICO LA SALA] Modelo ${model} en enfriamiento activo hasta ${new Date(cooldownUntil).toISOString().substring(11, 19)}.`);
+            console.log(`[DIAGNÓSTICO LA SALA] Modelo ${model} en enfriamiento activo.`);
             continue;
           }
 
           if (lastAttemptedModel && lastAttemptedModel !== model) {
-            console.log(`[DIAGNÓSTICO LA SALA] Cambio automático de modelo activado: pasando de ${lastAttemptedModel} a ${model}.`);
+            console.log(`[DIAGNÓSTICO LA SALA] Cambio automático de modelo: pasando a ${model}.`);
           }
           lastAttemptedModel = model;
 
@@ -1006,7 +901,7 @@ export class SalaRoom implements DurableObject {
               aiText = raw.replace(/^["']|["']$/g, "").replace(/\n+/g, " ").trim().slice(0, 180);
               usedEngine = "gemini";
               usedModel = model;
-              console.log(`[DIAGNÓSTICO LA SALA] ÉXITO: Respuesta generada por Gemini | Modelo utilizado: ${model} | Longitud: ${aiText.length} chars | Motor: GEMINI`);
+              console.log(`[DIAGNÓSTICO LA SALA] ÉXITO: Respuesta generada por Gemini | Modelo: ${model} | Longitud: ${aiText.length} chars`);
               break;
             }
           } catch (err: any) {
@@ -1022,26 +917,111 @@ export class SalaRoom implements DurableObject {
             } else {
               modelCooldowns.set(model, Date.now() + 15 * 1000);
             }
-            console.log(`[DIAGNÓSTICO LA SALA] Error en modelo ${model} -> Código de error API: ${status} | Causa: ${errorMsg}`);
+            console.log(`[DIAGNÓSTICO LA SALA] Error en modelo ${model} -> Código: ${status} | Causa: ${errorMsg}`);
           }
         }
       } catch (err: any) {
-        console.log("[DIAGNÓSTICO LA SALA] Excepción en procesamiento de Gemini:", err?.message || err);
+        console.log("[DIAGNÓSTICO LA SALA] Excepción en llamada a Gemini:", err?.message || err);
       }
     }
 
     // Motor de respaldo inteligente contextual si Gemini no está configurado o falla
     if (!aiText) {
       console.log(`[DIAGNÓSTICO LA SALA] Derivando a getContextualFallback | Motor: FALLBACK`);
-      aiText = getContextualFallback(userPrompt, this.conversationContext);
+      aiText = getContextualFallback(userPrompt, room.conversationContext);
       usedEngine = "fallback";
       usedModel = undefined;
-      console.log(`[DIAGNÓSTICO LA SALA] Respuesta generada por getContextualFallback | Longitud: ${aiText.length} chars | Motor: FALLBACK`);
     }
 
     // Confirmar que sigue habiendo exactamente 1 usuario real antes de enviar
-    if (this.aiActive && this.activeClients.size === 1 && aiText) {
-      this.addMessage(aiText, true, undefined, usedEngine, usedModel);
+    if (room.aiActive && room.realUserCount === 1 && aiText) {
+      this.addMessage(room, aiText, true, undefined, usedEngine, usedModel);
     }
   }
+
+  // --------------------------------------------------------------------------
+  // Manejador del ciclo de vida WebSocket por cliente
+  // --------------------------------------------------------------------------
+  handleClientWebSocket(clientId: string, ws: WebSocket, sessionExpiresAt: number) {
+    const room = this.joinRoom(clientId, ws, sessionExpiresAt);
+
+    // Enviar sincronización inicial al cliente que se conecta
+    const now = Date.now();
+    const remainingSec = Math.max(1, Math.ceil((sessionExpiresAt - now) / 1000));
+    const activeList = Array.from(room.activeMessages.values()).map((m) => {
+      const elapsed = now - m.timestamp;
+      const remaining = Math.max(0, m.durationMs - elapsed);
+      return { ...m, durationMs: remaining };
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: "session_init",
+        remainingSessionSeconds: remainingSec,
+        activeMessages: activeList,
+      })
+    );
+
+    // Escuchar mensajes entrantes del cliente
+    ws.addEventListener("message", (event) => {
+      try {
+        const data = JSON.parse(event.data as string);
+
+        if (data.type === "leave_sala") {
+          this.leaveRoom(clientId);
+          ws.close(1000, "User Left");
+          return;
+        }
+
+        if (data.type === "send_message") {
+          const clientData = room.clients.get(clientId);
+          if (!clientData || Date.now() >= clientData.sessionExpiresAt) {
+            ws.send(JSON.stringify({ type: "error", error: "Tu tiempo en La Sala ha terminado." }));
+            return;
+          }
+
+          const text = (data.text || "").trim();
+          if (!text || text.length > 180) {
+            ws.send(JSON.stringify({ type: "error", error: "El mensaje debe tener entre 1 y 180 caracteres." }));
+            return;
+          }
+
+          const urlRegex = /(https?:\/\/|www\.|\.com|\.org|\.net|\.io|\.me)/i;
+          if (urlRegex.test(text)) {
+            ws.send(JSON.stringify({ type: "error", error: "No se permiten enlaces en La Sala." }));
+            return;
+          }
+
+          // Emitir a la sala
+          this.addMessage(room, text, false, clientId);
+        }
+      } catch (_) {}
+    });
+
+    ws.addEventListener("close", () => {
+      const cur = room.clients.get(clientId);
+      if (cur && cur.ws === ws) {
+        this.leaveRoom(clientId);
+      }
+    });
+
+    ws.addEventListener("error", () => {
+      const cur = room.clients.get(clientId);
+      if (cur && cur.ws === ws) {
+        this.leaveRoom(clientId);
+      }
+    });
+  }
 }
+
+// ============================================================================
+// WORKER ENTRY POINT
+// Todas las conexiones enrutan a la instancia compartida "sala_global"
+// ============================================================================
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const globalId = env.SALA_ROOM.idFromName("sala_global");
+    const salaStub = env.SALA_ROOM.get(globalId);
+    return salaStub.fetch(request);
+  },
+};

@@ -953,7 +953,7 @@ wss.on("connection", (ws: WebSocket, request) => {
         // Add and broadcast message
         const currentRoom = roomManager.getRoomForClient(clientId);
         if (currentRoom) {
-          currentRoom.addMessage(text, false);
+          currentRoom.addMessage(text, false, clientId);
         }
       }
     } catch (err) {
@@ -963,12 +963,18 @@ wss.on("connection", (ws: WebSocket, request) => {
 
   ws.on("close", () => {
     clearInterval(sessionCheckInterval);
-    roomManager.leaveRoom(clientId);
+    const room = roomManager.getRoomForClient(clientId);
+    if (room && room.clients.get(clientId)?.ws === ws) {
+      roomManager.leaveRoom(clientId);
+    }
   });
 
   ws.on("error", () => {
     clearInterval(sessionCheckInterval);
-    roomManager.leaveRoom(clientId);
+    const room = roomManager.getRoomForClient(clientId);
+    if (room && room.clients.get(clientId)?.ws === ws) {
+      roomManager.leaveRoom(clientId);
+    }
   });
 });
 
